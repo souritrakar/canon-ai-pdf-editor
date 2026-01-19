@@ -330,4 +330,35 @@
   .slide-in-from-top-4 {
     animation: slide-in-from-top 0.5s ease-out forwards;
   }
+
+  /* Command Capsule Animations */
+  @keyframes capsule-expand {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.95);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes capsule-collapse {
+    from {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+    to {
+      opacity: 0;
+      transform: translateY(8px) scale(0.95);
+    }
+  }
+
+  .animate-capsule-expand {
+    animation: capsule-expand 0.2s ease-out forwards;
+  }
+
+  .animate-capsule-collapse {
+    animation: capsule-collapse 0.15s ease-in forwards;
+  }
 }

@@ -1,0 +1,573 @@
+import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { AGENT_TOOLS, type AgentOperation } from "@/lib/agent/tools";
+import { buildSystemPrompt, buildUserMessage, type AgentContext } from "@/lib/agent/context";
+import type { MessageParam, ContentBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources/messages";
+
+const anthropicClient = new Anthropic();
+const geminiClient = new GoogleGenerativeAI("AIzaSyDKlaTp56xw2sVE1DrKsRuG4SGDI9ol_hs");
+
+// Use Opus 4.5 for main reasoning, Gemini 2.5 Flash for document scanning
+const MAIN_MODEL = "claude-opus-4-5-20251101";
+
+interface AgentRequest {
+  instruction: string;
+  context: AgentContext;
+  stream?: boolean;
+}
+
+interface ScanResult {
+  elementId: string;
+  textContent: string;
+  page?: number;
+}
+
+/**
+ * Extract text content from an HTML element, handling nested tags properly
+ */
+function extractTextFromElement(html: string, startPos: number): { text: string; endPos: number } | null {
+  // Find the tag name
+  const tagNameMatch = html.substring(startPos + 1).match(/^(\w+)/);
+  if (!tagNameMatch) return null;
+  const tagName = tagNameMatch[1];
+
+  // Find end of opening tag
+  const openTagEnd = html.indexOf('>', startPos);
+  if (openTagEnd === -1) return null;
+
+  // Check for self-closing tag
+  if (html[openTagEnd - 1] === '/') {
+    return { text: '', endPos: openTagEnd + 1 };
+  }
+
+  // Find matching closing tag, accounting for nested same-name tags
+  let depth = 1;
+  let pos = openTagEnd + 1;
+  const openPattern = new RegExp(`<${tagName}[\\s>]`, 'gi');
+  const closePattern = `</${tagName}>`;
+
+  while (depth > 0 && pos < html.length) {
+    const nextClose = html.indexOf(closePattern, pos);
+    if (nextClose === -1) break;
+
+    // Check for any opens between current pos and next close
+    openPattern.lastIndex = pos;
+    let nextOpen = openPattern.exec(html);
+    while (nextOpen && nextOpen.index < nextClose) {
+      depth++;
+      nextOpen = openPattern.exec(html);
+    }
+
+    depth--;
+    pos = nextClose + closePattern.length;
+
+    if (depth === 0) {
+      const content = html.substring(openTagEnd + 1, nextClose);
+      // Strip all HTML tags to get plain text
+      let text = content.replace(/<[^>]*>/g, '').trim();
+
+      // Normalize whitespace (multiple spaces → single space)
+      text = text.replace(/\s+/g, ' ');
+
+      // Fix for pdf2htmlEX: sometimes text is duplicated due to nested structure
+      // This happens because parent elements contain their children's text too
+
+      // Method 1: Check for direct string repetition with space/separator
+      // e.g., "FR 201 FR 201" or "Grade 10  Grade 10"
+      const halfLen = Math.floor(text.length / 2);
+      if (text.length >= 4) {
+        // Try to find if text is "X X" pattern (same text repeated)
+        for (let i = halfLen - 1; i <= halfLen + 1 && i > 0 && i < text.length; i++) {
+          const firstPart = text.substring(0, i).trim();
+          const secondPart = text.substring(i).trim();
+          if (firstPart === secondPart && firstPart.length > 0) {
+            text = firstPart;
+            break;
+          }
+        }
+      }
+
+      // Method 2: Word-based deduplication as fallback
+      // e.g., "Hello World Hello World" → "Hello World"
+      const words = text.split(/\s+/).filter(w => w.length > 0);
+      if (words.length >= 2 && words.length % 2 === 0) {
+        const half = words.length / 2;
+        const firstHalf = words.slice(0, half).join(' ');
+        const secondHalf = words.slice(half).join(' ');
+        if (firstHalf === secondHalf) {
+          text = firstHalf;
+        }
+      }
+
+      return { text, endPos: pos };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Use Gemini 2.5 Flash to intelligently scan document and find matching elements
+ *
+ * Strategy: Extract ALL text-bearing elements from the PDF HTML, then use Gemini
+ * to intelligently understand the query and find relevant elements.
+ * This allows for semantic queries like "redact all information pertaining to party B"
+ */
+async function scanDocument(query: string, documentHtml: string): Promise<ScanResult[]> {
+  console.log(`\n🔍 [Scan] Using Gemini 2.5 Flash for: "${query}"`);
+  console.log(`📄 [Scan] Document HTML length: ${documentHtml.length} chars`);
+
+  // Debug: Check if data-canon-id exists in the HTML at all
+  const canonIdCount = (documentHtml.match(/data-canon-id/g) || []).length;
+  console.log(`🔎 [Scan] Found ${canonIdCount} data-canon-id attributes in HTML`);
+
+  // Debug: Show a sample of the HTML to see structure
+  const sampleStart = documentHtml.indexOf('data-canon-id');
+  if (sampleStart !== -1) {
+    console.log(`📋 [Scan] Sample HTML around first data-canon-id:`);
+    console.log(documentHtml.substring(Math.max(0, sampleStart - 50), sampleStart + 150));
+  } else {
+    console.log(`⚠️ [Scan] NO data-canon-id found in HTML!`);
+    // Show sample of document structure
+    console.log(`📋 [Scan] Sample of HTML structure:`);
+    console.log(documentHtml.substring(0, 2000));
+  }
+
+  const elements: Array<{id: string, text: string, page: number}> = [];
+
+  // Extract ALL elements with data-canon-id attribute
+  const idPattern = /data-canon-id="([^"]+)"/g;
+  let match;
+
+  while ((match = idPattern.exec(documentHtml)) !== null) {
+    const id = match[1];
+
+    // Find the opening tag start (go back to find <)
+    let tagStart = match.index;
+    while (tagStart > 0 && documentHtml[tagStart] !== '<') {
+      tagStart--;
+    }
+
+    // Find the element's text content
+    const result = extractTextFromElement(documentHtml, tagStart);
+    if (result && result.text.length > 0) {
+      // Extract page number from ID (format: pf1-el-42)
+      const pageMatch = id.match(/^pf(\d+)/);
+      const page = pageMatch ? parseInt(pageMatch[1], 10) : 1;
+      elements.push({ id, text: result.text, page });
+    }
+  }
+
+  console.log(`📋 [Scan] Found ${elements.length} elements with data-canon-id`);
+
+  // Log elements per page for debugging
+  const pageCount: Record<number, number> = {};
+  elements.forEach(e => {
+    pageCount[e.page] = (pageCount[e.page] || 0) + 1;
+  });
+  console.log(`📄 [Scan] Elements per page:`, pageCount);
+
+  // Log sample elements for debugging
+  if (elements.length > 0) {
+    console.log(`📋 [Scan] Sample elements:`);
+    elements.slice(0, 10).forEach((e, i) => {
+      console.log(`  ${i + 1}. [${e.id}] (page ${e.page}): "${e.text.substring(0, 60)}${e.text.length > 60 ? '...' : ''}"`);
+    });
+  }
+
+  if (elements.length === 0) {
+    console.log(`⚠️ [Scan] No elements found with data-canon-id`);
+    return [];
+  }
+
+  // Create the FULL element list - NO TRUNCATION
+  // Gemini 2.5 Flash has a 1M token context window
+  const elementList = elements.map(e => `[${e.id}] (page ${e.page}): "${e.text}"`).join('\n');
+
+  console.log(`📤 [Scan] Sending ${elements.length} elements to Gemini (${elementList.length} chars)`);
+
+  const scanPrompt = `You are a document scanner for a PDF editor. Your task is to find ALL elements that match the user's query.
+
+USER QUERY: "${query}"
+
+DOCUMENT ELEMENTS (format: [element_id] (page N): "text content"):
+${elementList}
+
+INSTRUCTIONS:
+1. Analyze the user's query to understand what they want to find
+2. Go through EVERY element in the list above
+3. Select ALL elements that match the query criteria
+4. Be THOROUGH and COMPREHENSIVE - do not miss any matches
+5. Use semantic understanding - for example:
+   - "redact all information about Party B" should match any element mentioning Party B, their name, address, etc.
+   - "redact text containing french" should match any element with "french" (case-insensitive) anywhere in it
+   - "find all email addresses" should match any element containing @ symbols in email format
+
+CRITICAL RULES:
+- Return ONLY element IDs that exist EXACTLY as shown in the list above (e.g., "pf1-el-42")
+- Do NOT invent, modify, or guess IDs
+- Return ALL matches - thoroughness is essential
+- If no matches exist, return an empty array
+
+RESPONSE FORMAT:
+Return a JSON array with ALL matching elements. Each object must have:
+- elementId: the exact ID from the list (e.g., "pf1-el-42")
+- textContent: the text content of that element
+- page: the page number
+
+Example response:
+[
+  {"elementId": "pf1-el-42", "textContent": "example text", "page": 1},
+  {"elementId": "pf2-el-15", "textContent": "another match", "page": 2}
+]
+
+If no matches: []
+
+Return ONLY the JSON array, no other text or explanation.`;
+
+  try {
+    const model = geminiClient.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+    const result = await model.generateContent(scanPrompt);
+    const response = result.response;
+    const responseText = response.text();
+
+    console.log(`📥 [Scan] Gemini response length: ${responseText.length} chars`);
+
+    // Parse the JSON response
+    const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) {
+      console.log("⚠️ [Scan] No JSON array found in Gemini response");
+      console.log("Response:", responseText.substring(0, 500));
+      return [];
+    }
+
+    const rawResults: ScanResult[] = JSON.parse(jsonMatch[0]);
+    console.log(`📊 [Scan] Gemini returned ${rawResults.length} matches`);
+
+    // Validate that returned IDs actually exist in our element list
+    const validIds = new Set(elements.map(e => e.id));
+    const seenIds = new Set<string>();
+    const validResults = rawResults.filter(r => {
+      // Check if ID exists
+      if (!validIds.has(r.elementId)) {
+        console.log(`⚠️ [Scan] Filtering out invalid ID: ${r.elementId}`);
+        return false;
+      }
+      // Check for duplicates
+      if (seenIds.has(r.elementId)) {
+        console.log(`⚠️ [Scan] Filtering out duplicate ID: ${r.elementId}`);
+        return false;
+      }
+      seenIds.add(r.elementId);
+      return true;
+    });
+
+    console.log(`✅ [Scan] Found ${validResults.length} valid unique matches`);
+
+    // Log all valid matches
+    validResults.forEach((m, i) => {
+      console.log(`  ${i + 1}. [${m.elementId}] (page ${m.page}): "${m.textContent.substring(0, 50)}..."`);
+    });
+
+    return validResults;
+  } catch (error) {
+    console.error("❌ [Scan] Gemini error:", error);
+    return [];
+  }
+}
+
+/**
+ * Execute a tool call and return the result
+ */
+async function executeToolCall(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  documentHtml?: string
+): Promise<string> {
+  if (toolName === "scan_document") {
+    const query = toolInput.query as string;
+    if (!documentHtml) {
+      return JSON.stringify({ error: "No document HTML provided for scanning", matches: [] });
+    }
+    const results = await scanDocument(query, documentHtml);
+    return JSON.stringify({
+      matches: results,
+      count: results.length,
+      message: results.length > 0
+        ? `Found ${results.length} element(s) matching "${query}"`
+        : `No elements found matching "${query}"`
+    });
+  }
+
+  // For other tools (replace_text, redact_element, etc.), we don't execute server-side
+  // Just acknowledge that the operation was recorded
+  return JSON.stringify({
+    status: "queued",
+    message: `Operation ${toolName} queued for client-side execution`
+  });
+}
+
+export async function POST(request: Request): Promise<Response> {
+  try {
+    const { instruction, context, stream: useStream = true }: AgentRequest = await request.json();
+
+    if (!instruction?.trim()) {
+      return Response.json(
+        { success: false, error: "No instruction provided", operations: [], explanation: "" },
+        { status: 400 }
+      );
+    }
+
+    // Build prompts
+    const systemPrompt = buildSystemPrompt(context);
+    const userMessage = buildUserMessage(instruction, context);
+
+    console.log("\n" + "=".repeat(60));
+    console.log("🤖 [Agent] NEW REQUEST");
+    console.log("📝 Instruction:", instruction);
+    console.log("=".repeat(60));
+
+    // Stream response to client using SSE with agentic loop
+    if (useStream) {
+      const encoder = new TextEncoder();
+
+      const readableStream = new ReadableStream({
+        async start(controller) {
+          try {
+            // Helper to send SSE event
+            const send = (event: string, data: unknown) => {
+              controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+            };
+
+            // Conversation history for agentic loop
+            const messages: MessageParam[] = [{ role: "user", content: userMessage }];
+
+            // All operations collected across turns
+            const allOperations: AgentOperation[] = [];
+            let fullExplanation = "";
+
+            // Agentic loop - continue until model says "end_turn"
+            let turn = 0;
+            const maxTurns = 10; // Safety limit
+
+            while (turn < maxTurns) {
+              turn++;
+              console.log(`\n--- Turn ${turn} ---`);
+              send("turn_start", { turn });
+
+              const stream = anthropicClient.messages.stream({
+                model: MAIN_MODEL,
+                max_tokens: 4096,
+                system: systemPrompt,
+                tools: AGENT_TOOLS,
+                messages,
+              });
+
+              const toolCalls: Map<number, { id: string; name: string; inputJson: string }> = new Map();
+              let currentToolIndex = -1;
+              let turnText = "";
+
+              stream.on("text", (text) => {
+                process.stdout.write(text);
+                turnText += text;
+                send("text", { text });
+              });
+
+              // Use streamEvent to capture tool use events
+              stream.on("streamEvent", (event) => {
+                if (event.type === "content_block_start" && event.content_block.type === "tool_use") {
+                  currentToolIndex = event.index;
+                  const toolBlock = event.content_block;
+                  toolCalls.set(currentToolIndex, {
+                    id: toolBlock.id,
+                    name: toolBlock.name,
+                    inputJson: "",
+                  });
+                  console.log(`\n🔧 [Tool] ${toolBlock.name}`);
+                  // Don't send tool_start for scan_document - it runs server-side silently
+                  if (toolBlock.name !== "scan_document") {
+                    send("tool_start", { tool: toolBlock.name, id: toolBlock.id });
+                  }
+                }
+
+                if (event.type === "content_block_stop") {
+                  const tool = toolCalls.get(event.index);
+                  if (tool) {
+                    try {
+                      const input = tool.inputJson ? JSON.parse(tool.inputJson) : {};
+                      console.log(`✅ [Tool Complete] ${tool.name}:`, JSON.stringify(input));
+                      // Only send tool_complete for client-side tools, NOT scan_document
+                      if (tool.name !== "scan_document") {
+                        send("tool_complete", { tool: tool.name, id: tool.id, input });
+                      }
+                    } catch {
+                      if (tool.name !== "scan_document") {
+                        send("tool_complete", { tool: tool.name, id: tool.id, input: {} });
+                      }
+                    }
+                  }
+                }
+              });
+
+              stream.on("inputJson", (partialJson) => {
+                const tool = toolCalls.get(currentToolIndex);
+                if (tool) {
+                  // Accumulate the raw JSON string chunks
+                  tool.inputJson += partialJson;
+                }
+              });
+
+              // Wait for this turn to complete
+              const response = await stream.finalMessage();
+
+              fullExplanation += turnText;
+
+              // Collect operations from this turn
+              const turnToolCalls: Array<{ id: string; name: string; input: Record<string, unknown> }> = [];
+
+              for (const block of response.content) {
+                if (block.type === "tool_use") {
+                  turnToolCalls.push({
+                    id: block.id,
+                    name: block.name,
+                    input: block.input as Record<string, unknown>,
+                  });
+
+                  // Only add non-scan operations to the final operations list
+                  if (block.name !== "scan_document") {
+                    allOperations.push({
+                      id: block.id,
+                      tool: block.name,
+                      input: block.input as Record<string, unknown>,
+                    });
+                  }
+                }
+              }
+
+              console.log(`\n📊 [Turn ${turn}] ${turnToolCalls.length} tool call(s), stop_reason: ${response.stop_reason}`);
+
+              // If no tool calls or stop_reason is end_turn, we're done
+              if (response.stop_reason === "end_turn" || turnToolCalls.length === 0) {
+                console.log("✅ [Agent] Completed - end_turn or no more tools");
+                break;
+              }
+
+              // Otherwise, we need to execute tools and continue the loop
+              // Build assistant message with all content blocks
+              const assistantContent: ContentBlockParam[] = response.content.map(block => {
+                if (block.type === "text") {
+                  return { type: "text" as const, text: block.text };
+                } else if (block.type === "tool_use") {
+                  return {
+                    type: "tool_use" as const,
+                    id: block.id,
+                    name: block.name,
+                    input: block.input as Record<string, unknown>
+                  };
+                }
+                return { type: "text" as const, text: "" };
+              });
+
+              messages.push({ role: "assistant", content: assistantContent });
+
+              // Execute each tool and collect results
+              const toolResults: ToolResultBlockParam[] = [];
+
+              for (const toolCall of turnToolCalls) {
+                console.log(`\n⚡ [Executing] ${toolCall.name}`);
+                send("tool_executing", { tool: toolCall.name, id: toolCall.id });
+
+                const result = await executeToolCall(
+                  toolCall.name,
+                  toolCall.input,
+                  context.documentHtml
+                );
+
+                console.log(`📤 [Result] ${toolCall.name}:`, result.substring(0, 200));
+                send("tool_result", { tool: toolCall.name, id: toolCall.id, result: JSON.parse(result) });
+
+                toolResults.push({
+                  type: "tool_result",
+                  tool_use_id: toolCall.id,
+                  content: result,
+                });
+              }
+
+              // Add tool results to messages
+              messages.push({ role: "user", content: toolResults });
+            }
+
+            if (turn >= maxTurns) {
+              console.log("⚠️ [Agent] Hit max turns limit");
+            }
+
+            console.log(`\n📊 [Done] Total: ${allOperations.length} operation(s) across ${turn} turn(s)`);
+
+            // Send final complete event
+            send("complete", {
+              success: true,
+              operations: allOperations,
+              explanation: fullExplanation.trim(),
+              turns: turn,
+            });
+
+            controller.close();
+          } catch (error) {
+            console.error("❌ Stream error:", error);
+            const errorMsg = error instanceof Error ? error.message : "Unknown error";
+            controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: errorMsg })}\n\n`));
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(readableStream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
+    }
+
+    // Non-streaming fallback (simplified - no agentic loop)
+    const response = await anthropicClient.messages.create({
+      model: MAIN_MODEL,
+      max_tokens: 2048,
+      system: systemPrompt,
+      tools: AGENT_TOOLS,
+      messages: [{ role: "user", content: userMessage }],
+    });
+
+    const operations: AgentOperation[] = [];
+    let explanation = "";
+
+    for (const block of response.content) {
+      if (block.type === "tool_use") {
+        operations.push({
+          id: block.id,
+          tool: block.name,
+          input: block.input as Record<string, unknown>,
+        });
+      } else if (block.type === "text") {
+        explanation += block.text;
+      }
+    }
+
+    return Response.json({
+      success: true,
+      operations,
+      explanation: explanation.trim(),
+      stopReason: response.stop_reason ?? "end_turn",
+    });
+
+  } catch (error) {
+    console.error("❌ Agent API error:", error);
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    return Response.json(
+      { success: false, error: errorMessage, operations: [], explanation: "" },
+      { status: 500 }
+    );
+  }
+}

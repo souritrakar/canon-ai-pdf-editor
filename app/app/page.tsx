@@ -2,19 +2,34 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
-import { PDFViewer, type PDFViewerRef, type SelectedElement, EditorToolbar, type EditorMode } from "@/components/editor";
+import { PDFViewer, type PDFViewerRef, type SelectedElement, EditorToolbar, type EditorMode, PageThumbnails, CommandCapsule } from "@/components/editor";
+import { extractContext, executeOperations, type AgentOperation, type ExecutionResult } from "@/lib/agent";
 
 export default function AppPage(): React.ReactElement {
-  const [instruction, setInstruction] = useState("");
-  const [proposedChanges, setProposedChanges] = useState<string[]>([]);
   const [documentName, setDocumentName] = useState<string | null>(null);
   const [isConverting, setIsConverting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedElement, setSelectedElement] = useState<SelectedElement | null>(null);
   const [isExporting, setIsExporting] = useState(false);
   const [editorMode, setEditorMode] = useState<EditorMode>("select");
+  const [pdfLoaded, setPdfLoaded] = useState(false);
+  const [isCommandOpen, setIsCommandOpen] = useState(false);
 
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Agent state
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [agentOperations, setAgentOperations] = useState<AgentOperation[]>([]);
+  const [agentExplanation, setAgentExplanation] = useState("");
+  const [agentError, setAgentError] = useState<string | null>(null);
+
+  // Change ledger: only tracks APPLIED changes (results of work)
+  const [changeLedger, setChangeLedger] = useState<Array<{
+    id: string;
+    type: "text-replace" | "redact" | "insert" | "delete" | "format" | "highlight" | "comment";
+    description: string;
+    page?: number;
+    timestamp: Date;
+  }>>([]);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pdfViewerRef = useRef<PDFViewerRef>(null);
 
@@ -44,11 +59,14 @@ export default function AppPage(): React.ReactElement {
         }
 
         pdfViewerRef.current?.loadHtml(data.html);
-        setProposedChanges([]);
+        setPdfLoaded(true);
+        setAgentOperations([]);
+        setAgentExplanation("");
       } catch (err) {
         console.error("Failed to convert PDF:", err);
         setError(err instanceof Error ? err.message : "Failed to convert PDF");
         pdfViewerRef.current?.clear();
+        setPdfLoaded(false);
       } finally {
         setIsConverting(false);
       }
@@ -116,50 +134,256 @@ export default function AppPage(): React.ReactElement {
     }
   }, [documentName]);
 
+  // Submit instruction to AI agent with streaming
+  const handleSubmit = useCallback(async (instructionText: string): Promise<void> => {
+    if (!instructionText.trim()) return;
 
-  const handleSubmit = useCallback((): void => {
-    if (!instruction.trim()) return;
+    setIsProcessing(true);
+    setAgentError(null);
+    setAgentOperations([]);
+    setAgentExplanation("");
 
-    // Placeholder: would trigger AI analysis
-    setProposedChanges([
-      "Replace 'John Doe' with 'Jane Smith' on page 1",
-      "Update date from '2024-01-15' to '2024-12-15' on page 2",
-    ]);
-    setInstruction("");
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
-  }, [instruction]);
+    try {
+      // Extract context from current state
+      const context = extractContext(
+        selectedElement,
+        pdfViewerRef.current?.getIframeRef() ?? null
+      );
 
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>): void => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        handleSubmit();
+      // Call agent API with streaming
+      const response = await fetch("/api/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instruction: instructionText,
+          context,
+          stream: true,
+        }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || "Agent request failed");
       }
-    },
-    [handleSubmit]
-  );
 
-  // Auto-resize textarea
+      // Read SSE stream
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No response body");
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let streamedText = "";
+      let currentEventType = "";
+      const collectedOperations: AgentOperation[] = [];
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || ""; // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (line.startsWith("event: ")) {
+            currentEventType = line.slice(7).trim();
+            continue;
+          }
+          if (line.startsWith("data: ")) {
+            const jsonStr = line.slice(6);
+            if (!jsonStr.trim()) continue;
+
+            try {
+              const data = JSON.parse(jsonStr);
+
+              // Route based on event type
+              switch (currentEventType) {
+                case "text":
+                  // Streaming text from agent reasoning
+                  if (data.text) {
+                    streamedText += data.text;
+                    setAgentExplanation(streamedText);
+                  }
+                  break;
+
+                case "tool_start":
+                  // Tool is starting - could show in UI
+                  console.log(`[Agent] Tool starting: ${data.tool}`);
+                  break;
+
+                case "tool_complete":
+                  // Tool completed - add to operations
+                  if (data.tool && data.id) {
+                    const op = {
+                      id: data.id,
+                      tool: data.tool,
+                      input: data.input || {},
+                    };
+                    collectedOperations.push(op);
+                    setAgentOperations([...collectedOperations]);
+                    console.log(`[Agent] Tool complete: ${data.tool}`, data.input);
+                  }
+                  break;
+
+                case "tool_executing":
+                  // Server is executing a tool (like scan_document)
+                  console.log(`[Agent] Executing: ${data.tool}`);
+                  break;
+
+                case "tool_result":
+                  // Result from server-executed tool
+                  console.log(`[Agent] Tool result: ${data.tool}`, data.result);
+                  break;
+
+                case "turn_start":
+                  // New turn in agentic loop
+                  console.log(`[Agent] Turn ${data.turn}`);
+                  break;
+
+                case "complete":
+                  // Final completion - use final operations array
+                  console.log(`[Agent] Complete:`, data);
+                  if (data.operations && data.operations.length > 0) {
+                    setAgentOperations(data.operations);
+                  }
+                  if (data.explanation) {
+                    setAgentExplanation(data.explanation);
+                  }
+                  break;
+
+                case "error":
+                  throw new Error(data.error || "Unknown error");
+
+                default:
+                  // Fallback: try to infer from data shape
+                  if (data.text !== undefined) {
+                    streamedText += data.text;
+                    setAgentExplanation(streamedText);
+                  } else if (data.success !== undefined && data.operations) {
+                    setAgentOperations(data.operations);
+                  }
+              }
+            } catch (parseErr) {
+              if (parseErr instanceof Error && parseErr.message !== "Unknown error") {
+                console.warn("Failed to parse SSE data:", jsonStr, parseErr);
+              } else {
+                throw parseErr;
+              }
+            }
+          }
+        }
+      }
+
+    } catch (err) {
+      console.error("Agent error:", err);
+      setAgentError(err instanceof Error ? err.message : "Failed to process instruction");
+    } finally {
+      setIsProcessing(false);
+    }
+  }, [selectedElement]);
+
+  // Apply operations when user confirms
+  const handleApplyChanges = useCallback(async (): Promise<void> => {
+    console.log("[Apply] ========== APPLY CHANGES CALLED ==========");
+    console.log("[Apply] agentOperations:", agentOperations);
+    console.log("[Apply] agentOperations.length:", agentOperations.length);
+
+    if (agentOperations.length === 0) {
+      console.log("[Apply] ERROR: No operations - agentOperations is empty!");
+      return;
+    }
+
+    const pdfViewer = pdfViewerRef.current;
+    console.log("[Apply] pdfViewerRef.current exists:", !!pdfViewer);
+
+    if (!pdfViewer) {
+      console.log("[Apply] ERROR: No pdfViewer ref");
+      return;
+    }
+
+    const iframeRef = pdfViewer.getIframeRef();
+    console.log("[Apply] iframeRef exists:", !!iframeRef);
+    console.log("[Apply] iframeRef.current exists:", !!iframeRef?.current);
+
+    if (!iframeRef) {
+      console.log("[Apply] ERROR: No iframe ref");
+      return;
+    }
+
+    console.log("[Apply] Executing", agentOperations.length, "operations");
+
+    // Execute all operations
+    const results: ExecutionResult[] = await executeOperations(agentOperations, iframeRef);
+    console.log("[Apply] Results:", results);
+
+    // Add successful operations to ledger
+    const newEntries = results
+      .filter(r => r.success)
+      .map(r => {
+        const op = agentOperations.find(o => o.id === r.operationId);
+        return {
+          id: crypto.randomUUID(),
+          type: mapToolToChangeType(op?.tool || ""),
+          description: formatOperationForLedger(op),
+          timestamp: new Date(),
+        };
+      });
+
+    if (newEntries.length > 0) {
+      setChangeLedger(prev => [...newEntries, ...prev]);
+    }
+
+    // Check for errors
+    const errors = results.filter(r => !r.success);
+    if (errors.length > 0) {
+      console.error("Some operations failed:", errors);
+    }
+
+    // Clear operations
+    setAgentOperations([]);
+    setAgentExplanation("");
+    handleClearSelection();
+  }, [agentOperations, handleClearSelection]);
+
+  // Dismiss operations without applying
+  const handleDismissChanges = useCallback((): void => {
+    setAgentOperations([]);
+    setAgentExplanation("");
+    setAgentError(null);
+  }, []);
+
+  // Global Ctrl+Q handler for command capsule
   useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 200)}px`;
-    }
-  }, [instruction]);
+    const handleGlobalKeyDown = (e: KeyboardEvent): void => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "q") {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        if (documentName && !isConverting) {
+          setIsCommandOpen(prev => !prev);
+        }
+      }
+    };
 
-  // Update placeholder text based on selection
-  const getPlaceholderText = (): string => {
-    if (!documentName || isConverting) {
-      return "Upload a PDF first...";
-    }
-    if (selectedElement) {
-      const preview = selectedElement.textContent.substring(0, 30);
-      return `Edit "${preview}${selectedElement.textContent.length > 30 ? '...' : ''}"`;
-    }
-    return "Select an element or describe changes...";
-  };
+    // Listen for Ctrl+Q forwarded from iframe
+    const handleMessage = (e: MessageEvent): void => {
+      if (e.data?.type === "canon-ctrl-q") {
+        if (documentName && !isConverting) {
+          setIsCommandOpen(prev => !prev);
+        }
+      }
+    };
+
+    // Use capture phase to catch the event before browser handles it
+    window.addEventListener("keydown", handleGlobalKeyDown, { capture: true });
+    document.addEventListener("keydown", handleGlobalKeyDown, { capture: true });
+    window.addEventListener("message", handleMessage);
+    return () => {
+      window.removeEventListener("keydown", handleGlobalKeyDown, { capture: true });
+      document.removeEventListener("keydown", handleGlobalKeyDown, { capture: true });
+      window.removeEventListener("message", handleMessage);
+    };
+  }, [documentName, isConverting]);
 
   return (
     <div className="flex h-screen bg-background overflow-hidden">
@@ -270,25 +494,38 @@ export default function AppPage(): React.ReactElement {
           )}
         </div>
 
-        <div className="flex-1 overflow-hidden p-4 relative">
-          {/* Floating Toolbar */}
-          {documentName && !isConverting && (
-            <div className="absolute top-8 left-1/2 -translate-x-1/2 z-20">
-              <EditorToolbar
-                activeMode={editorMode}
-                onModeChange={setEditorMode}
-                disabled={!documentName || isConverting}
+        <div className="flex-1 overflow-hidden p-4 relative flex gap-4">
+          {/* Page Thumbnails Panel - Inside Editor Area */}
+          {pdfLoaded && pdfViewerRef.current && (
+            <div className="w-32 flex-shrink-0 bg-[#525659] rounded-lg overflow-hidden">
+              <PageThumbnails
+                iframeRef={pdfViewerRef.current.getIframeRef()}
+                className="h-full"
               />
             </div>
           )}
 
-          {/* Always render PDFViewer to maintain ref */}
-          <PDFViewer
-            ref={pdfViewerRef}
-            className="w-full h-full"
-            editorMode={editorMode}
-            onElementSelect={handleElementSelect}
-          />
+          {/* Main Document View */}
+          <div className="flex-1 relative">
+            {/* Floating Toolbar */}
+            {documentName && !isConverting && (
+              <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20">
+                <EditorToolbar
+                  activeMode={editorMode}
+                  onModeChange={setEditorMode}
+                  disabled={!documentName || isConverting}
+                />
+              </div>
+            )}
+
+            {/* Always render PDFViewer to maintain ref */}
+            <PDFViewer
+              ref={pdfViewerRef}
+              className="w-full h-full"
+              editorMode={editorMode}
+              onElementSelect={handleElementSelect}
+            />
+          </div>
 
           {/* Overlay for loading state */}
           {isConverting && (
@@ -318,153 +555,152 @@ export default function AppPage(): React.ReactElement {
             </div>
           )}
         </div>
+
+        {/* Floating Command Capsule */}
+        <CommandCapsule
+          isOpen={isCommandOpen}
+          onToggle={() => setIsCommandOpen(prev => !prev)}
+          selectedElement={selectedElement}
+          onClearSelection={handleClearSelection}
+          onSubmit={handleSubmit}
+          operations={agentOperations}
+          explanation={agentExplanation}
+          onApplyChanges={handleApplyChanges}
+          onDismissChanges={handleDismissChanges}
+          disabled={!documentName || isConverting}
+          isProcessing={isProcessing}
+          error={agentError}
+        />
       </main>
 
-      {/* Right Panel - Selection Info & AI Chat */}
-      <aside className="w-80 border-l border-border bg-surface flex flex-col">
-        <div className="p-4 border-b border-border">
-          <h2 className="text-h3 font-display font-semibold text-text-primary">
-            Edit Document
-          </h2>
+      {/* Right Panel - Change Ledger (Results Only) */}
+      <aside className="w-72 border-l border-border bg-surface flex flex-col">
+        <div className="p-4 border-b border-border flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <svg
+              className="w-5 h-5 text-text-secondary"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={1.5}
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25zM6.75 12h.008v.008H6.75V12zm0 3h.008v.008H6.75V15zm0 3h.008v.008H6.75V18z"
+              />
+            </svg>
+            <h2 className="text-h3 font-display font-semibold text-text-primary">
+              Changes
+            </h2>
+          </div>
+          {changeLedger.length > 0 && (
+            <span className="text-xs text-text-tertiary bg-surface-subtle px-2 py-0.5 rounded-full">
+              {changeLedger.length}
+            </span>
+          )}
         </div>
 
-        {/* Scrollable content area */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {/* Selected Element Info */}
-          {selectedElement ? (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-body font-semibold text-text-primary">
-                  Selected Element
-                </h3>
-                <button
-                  onClick={handleClearSelection}
-                  className="text-xs text-text-tertiary hover:text-text-secondary transition-colors"
+        {/* Change Ledger - Applied Changes Only */}
+        <div className="flex-1 overflow-y-auto p-3">
+          {changeLedger.length > 0 ? (
+            <div className="space-y-2">
+              {changeLedger.map((item) => (
+                <div
+                  key={item.id}
+                  className="p-3 rounded-lg bg-surface-subtle border border-border hover:border-border-strong transition-colors"
                 >
-                  Clear
-                </button>
-              </div>
-              <div className="p-3 rounded-lg bg-primary/5 border border-primary/20">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="px-2 py-0.5 text-xs font-mono bg-primary/10 text-primary rounded">
-                    {selectedElement.tagName}
-                  </span>
-                  {selectedElement.className && (
-                    <span className="text-xs text-text-tertiary font-mono truncate">
-                      .{selectedElement.className.split(' ')[0]}
-                    </span>
-                  )}
-                </div>
-                <p className="text-sm text-text-primary font-body leading-relaxed">
-                  {selectedElement.textContent || "(no text content)"}
-                </p>
-              </div>
-              <p className="text-xs text-text-tertiary">
-                Use the input below to describe what you want to do with this element.
-              </p>
-            </div>
-          ) : proposedChanges.length > 0 ? (
-            <>
-              <div>
-                <h3 className="text-sm font-body font-semibold text-text-primary mb-3">
-                  Proposed Changes
-                </h3>
-                <div className="space-y-2">
-                  {proposedChanges.map((change, index) => (
-                    <div
-                      key={index}
-                      className="p-3 rounded-lg bg-surface-subtle border border-border"
-                    >
-                      <p className="text-sm text-text-primary font-body">
-                        {change}
-                      </p>
+                  <div className="flex items-start gap-2">
+                    <div className="w-5 h-5 rounded flex items-center justify-center shrink-0 bg-green-100 text-green-600">
+                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                      </svg>
                     </div>
-                  ))}
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-text-primary font-body leading-snug">
+                        {item.description}
+                      </p>
+                      <div className="flex items-center gap-2 mt-1">
+                        {item.page && (
+                          <span className="text-[10px] text-text-tertiary">
+                            Page {item.page}
+                          </span>
+                        )}
+                        <span className="text-[10px] text-text-tertiary">
+                          {item.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <div className="pt-2">
-                <Button className="w-full bg-primary hover:bg-primary-hover text-text-inverse">
-                  Apply Changes
-                </Button>
-              </div>
-            </>
+              ))}
+            </div>
           ) : (
             <div className="flex items-center justify-center h-full">
-              <div className="text-center">
+              <div className="text-center px-4">
                 <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-surface-subtle flex items-center justify-center">
                   <svg
                     className="w-6 h-6 text-text-tertiary"
                     fill="none"
                     viewBox="0 0 24 24"
                     stroke="currentColor"
+                    strokeWidth={1.5}
                   >
                     <path
                       strokeLinecap="round"
                       strokeLinejoin="round"
-                      strokeWidth={1.5}
-                      d="M15.042 21.672L13.684 16.6m0 0l-2.51 2.225.569-9.47 5.227 7.917-3.286-.672zM12 2.25V4.5m5.834.166l-1.591 1.591M20.25 10.5H18M7.757 14.743l-1.59 1.59M6 10.5H3.75m4.007-4.243l-1.59-1.59"
+                      d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25zM6.75 12h.008v.008H6.75V12zm0 3h.008v.008H6.75V15zm0 3h.008v.008H6.75V18z"
                     />
                   </svg>
                 </div>
                 <p className="text-sm text-text-tertiary font-body">
-                  {documentName && !isConverting
-                    ? "Click an element in the document to select it"
-                    : "Upload a PDF to start editing"}
+                  No changes applied yet
+                </p>
+                <p className="text-xs text-text-tertiary font-body mt-1">
+                  Applied edits will appear here
                 </p>
               </div>
             </div>
           )}
         </div>
-
-        {/* Fixed AI Chat Input Bar at Bottom */}
-        <div className="border-t border-border bg-surface p-4">
-          <div className="relative">
-            <div className="flex items-end gap-2 rounded-xl border-2 border-border bg-surface-subtle focus-within:border-primary focus-within:ring-2 focus-within:ring-primary/20 transition-all duration-200 shadow-sm">
-              <textarea
-                ref={textareaRef}
-                value={instruction}
-                onChange={(e) => setInstruction(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder={getPlaceholderText()}
-                disabled={!documentName || isConverting}
-                className="flex-1 px-4 py-3 bg-transparent text-text-primary font-body placeholder:text-text-tertiary focus:outline-none resize-none max-h-[200px] overflow-y-auto disabled:cursor-not-allowed disabled:opacity-50"
-                rows={1}
-              />
-              <button
-                onClick={handleSubmit}
-                disabled={!instruction.trim() || !documentName || isConverting}
-                className="m-2 p-2 rounded-lg bg-primary hover:bg-primary-hover text-text-inverse disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 flex items-center justify-center shrink-0"
-                title="Send (Enter)"
-              >
-                <svg
-                  className="w-4 h-4"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
-                  />
-                </svg>
-              </button>
-            </div>
-            <p className="mt-2 text-xs text-text-tertiary font-body text-center">
-              Press{" "}
-              <kbd className="px-1.5 py-0.5 rounded bg-surface-subtle border border-border text-xs">
-                Enter
-              </kbd>{" "}
-              to send,{" "}
-              <kbd className="px-1.5 py-0.5 rounded bg-surface-subtle border border-border text-xs">
-                Shift+Enter
-              </kbd>{" "}
-              for new line
-            </p>
-          </div>
-        </div>
       </aside>
     </div>
   );
+}
+
+// Helper functions
+function mapToolToChangeType(tool: string): "text-replace" | "redact" | "insert" | "delete" | "format" | "highlight" | "comment" {
+  switch (tool) {
+    case "replace_text":
+      return "text-replace";
+    case "redact_element":
+      return "redact";
+    case "delete_element":
+      return "delete";
+    case "add_highlight":
+      return "highlight";
+    case "add_comment":
+      return "comment";
+    default:
+      return "format";
+  }
+}
+
+function formatOperationForLedger(op: AgentOperation | undefined): string {
+  if (!op) return "Unknown operation";
+
+  switch (op.tool) {
+    case "replace_text":
+      return `Replaced "${op.input.oldText}" with "${op.input.newText}"`;
+    case "redact_element":
+      return "Redacted element";
+    case "add_highlight":
+      return "Highlighted element";
+    case "add_comment":
+      return `Added comment: "${op.input.comment}"`;
+    case "delete_element":
+      return "Deleted element";
+    default:
+      return `Applied ${op.tool}`;
+  }
 }
