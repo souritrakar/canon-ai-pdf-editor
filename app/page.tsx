@@ -2,7 +2,7 @@
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { SyncedDemo } from "@/components/synced-demo";
+import { CanonDemoSlideshow } from "@/components/remotion";
 import { FadeInOnScroll } from "@/components/scroll-animation";
 import { HowItWorks } from "@/components/how-it-works";
 import { useEffect, useState } from "react";
@@ -58,7 +58,7 @@ export default function Home() {
           <FadeInOnScroll>
             <div className="text-center mb-16">
               <h1 className="text-display font-display font-semibold text-text-primary mb-6 tracking-tight">
-                Edit PDFs with
+                Create and edit PDFs with
                 <br />
                 <span className="text-primary">natural language</span>
               </h1>
@@ -87,9 +87,11 @@ export default function Home() {
             </div>
           </FadeInOnScroll>
 
-          {/* Aligned Prompt and PDF Demo */}
+          {/* Remotion-powered Demo Slideshow */}
           <FadeInOnScroll delay={200}>
-            <SyncedDemo />
+            <div className="max-w-4xl mx-auto px-16">
+              <CanonDemoSlideshow />
+            </div>
           </FadeInOnScroll>
         </div>
       </section>

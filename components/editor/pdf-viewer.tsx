@@ -125,6 +125,65 @@ const SELECTION_SCRIPT = `
     subtree: true
   });
 
+  // ===========================================
+  // COORDINATE SYSTEM
+  // Compute page-relative bounding boxes for all elements
+  // ===========================================
+  function computeCoordinates() {
+    var pages = document.querySelectorAll('.pf, .pc');
+
+    // Store page dimensions
+    pages.forEach(function(page, pageIndex) {
+      page.setAttribute('data-canon-page-num', String(pageIndex + 1));
+      page.setAttribute('data-canon-page-width', String(page.offsetWidth));
+      page.setAttribute('data-canon-page-height', String(page.offsetHeight));
+    });
+
+    // Compute element coordinates
+    var elements = document.querySelectorAll('[data-canon-id]');
+    elements.forEach(function(el) {
+      var page = el.closest('.pf, .pc');
+      if (!page) return;
+
+      var pageRect = page.getBoundingClientRect();
+      var elRect = el.getBoundingClientRect();
+
+      // Page-relative coordinates (origin: top-left of page)
+      var x = elRect.left - pageRect.left;
+      var y = elRect.top - pageRect.top;
+
+      el.setAttribute('data-canon-x', x.toFixed(1));
+      el.setAttribute('data-canon-y', y.toFixed(1));
+      el.setAttribute('data-canon-width', elRect.width.toFixed(1));
+      el.setAttribute('data-canon-height', elRect.height.toFixed(1));
+      el.setAttribute('data-canon-page', page.getAttribute('data-canon-page-num') || '1');
+    });
+
+    console.log('[Canon] Computed coordinates for ' + elements.length + ' elements');
+    window.parent.postMessage({ type: 'canon-coordinates-ready', count: elements.length }, '*');
+  }
+
+  // Schedule coordinate computation after fonts load
+  function scheduleCoordinateComputation() {
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(function() {
+        requestAnimationFrame(computeCoordinates);
+      });
+    } else {
+      setTimeout(computeCoordinates, 1000);
+    }
+  }
+
+  // Compute coordinates after IDs are assigned
+  scheduleCoordinateComputation();
+
+  // Recompute coordinates on window resize (debounced)
+  var resizeTimeout = null;
+  window.addEventListener('resize', function() {
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(computeCoordinates, 250);
+  });
+
   function isRedacted(el) {
     return el && el.hasAttribute && el.hasAttribute('data-canon-redacted');
   }

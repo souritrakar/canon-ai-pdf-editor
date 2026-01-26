@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import puppeteer, { type PDFOptions } from "puppeteer";
+import { PDFDocument } from "pdf-lib";
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
   let browser = null;
@@ -225,14 +226,37 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       outline: false,
     };
 
-    // Generate PDF
+    // Generate PDF with Puppeteer
     const pdfBuffer = await page.pdf(pdfOptions);
 
     await browser.close();
     browser = null;
 
+    // Load the PDF with pdf-lib to add JavaScript
+    // This JavaScript will execute when the PDF is opened in Chrome/Acrobat
+    const pdfDoc = await PDFDocument.load(pdfBuffer);
+
+    // Add JavaScript that runs when the PDF opens
+    // Note: Chrome's PDFium has limited JS support (app.alert works, console does not)
+    // Full support available in Adobe Acrobat Reader
+    const openScript = `
+      // Canon PDF - Generated with JavaScript support
+      // This script runs when the document opens
+
+      // Show a subtle notification (works in Acrobat)
+      // app.alert("Document opened successfully", 3);
+
+      // For Chrome PDFium compatibility, we keep it minimal
+      // Most advanced features only work in Acrobat Reader
+    `;
+
+    pdfDoc.addJavaScript('canonOpenScript', openScript);
+
+    // Save the modified PDF
+    const finalPdfBytes = await pdfDoc.save();
+
     return NextResponse.json({
-      pdf: Buffer.from(pdfBuffer).toString("base64"),
+      pdf: Buffer.from(finalPdfBytes).toString("base64"),
       filename: "document.pdf",
       pageInfo: {
         width: pageInfo.width,

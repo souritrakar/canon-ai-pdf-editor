@@ -1,6 +1,34 @@
 import type { SelectedElement } from "@/components/editor/pdf-viewer";
 
 /**
+ * Message in conversation history
+ */
+export interface ConversationMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/**
+ * Coordinate data for an element (page-relative)
+ */
+export interface ElementCoords {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  page: number;
+}
+
+/**
+ * Page dimension info
+ */
+export interface PageInfo {
+  pageNum: number;
+  width: number;
+  height: number;
+}
+
+/**
  * Context types for the agent
  */
 export interface AgentContext {
@@ -8,9 +36,14 @@ export interface AgentContext {
     id: string;
     textContent: string;
     tagName: string;
+    coords?: ElementCoords;
   };
   // Full HTML for scan_document tool - contains all text and element IDs
   documentHtml?: string;
+  // Conversation history for multi-turn context
+  conversationHistory?: ConversationMessage[];
+  // Page dimensions for spatial context
+  pageInfo?: PageInfo[];
 }
 
 /**
@@ -92,20 +125,61 @@ export function extractContext(
     console.warn(`[Context] No iframe document available`);
   }
 
-  // If element is selected, include that context
+  // Extract page dimensions from data attributes
+  let pageInfo: PageInfo[] | undefined;
+  if (iframeDoc) {
+    const pages = iframeDoc.querySelectorAll('[data-canon-page-num]');
+    if (pages.length > 0) {
+      pageInfo = Array.from(pages).map((page) => ({
+        pageNum: parseInt(page.getAttribute('data-canon-page-num') || '1', 10),
+        width: parseFloat(page.getAttribute('data-canon-page-width') || '612'),
+        height: parseFloat(page.getAttribute('data-canon-page-height') || '792'),
+      }));
+      console.log(`[Context] Extracted page info for ${pageInfo.length} pages`);
+    }
+  }
+
+  // If element is selected, include that context with coordinates
   if (selectedElement) {
+    let coords: ElementCoords | undefined;
+
+    // Extract coordinates from element's data attributes
+    if (iframeDoc) {
+      const el = iframeDoc.querySelector(`[data-canon-id="${selectedElement.id}"]`);
+      if (el) {
+        const x = el.getAttribute('data-canon-x');
+        const y = el.getAttribute('data-canon-y');
+        const w = el.getAttribute('data-canon-width');
+        const h = el.getAttribute('data-canon-height');
+        const p = el.getAttribute('data-canon-page');
+
+        if (x && y && w && h) {
+          coords = {
+            x: parseFloat(x),
+            y: parseFloat(y),
+            width: parseFloat(w),
+            height: parseFloat(h),
+            page: parseInt(p || '1', 10),
+          };
+          console.log(`[Context] Selected element coords: (${coords.x}, ${coords.y}) ${coords.width}x${coords.height} on page ${coords.page}`);
+        }
+      }
+    }
+
     return {
       selectedElement: {
         id: selectedElement.id,
         textContent: selectedElement.textContent,
         tagName: selectedElement.tagName,
+        coords,
       },
       documentHtml,
+      pageInfo,
     };
   }
 
-  // No selection - just return documentHtml
-  return { documentHtml };
+  // No selection - just return documentHtml and pageInfo
+  return { documentHtml, pageInfo };
 }
 
 /**
@@ -115,7 +189,16 @@ export function buildUserMessage(instruction: string, context: AgentContext): st
   let message = instruction;
 
   if (context.selectedElement) {
-    message += `\n\n[CONTEXT: User has selected an element with ID "${context.selectedElement.id}" containing text: "${context.selectedElement.textContent}"]`;
+    let contextStr = `[CONTEXT: User has selected an element with ID "${context.selectedElement.id}" containing text: "${context.selectedElement.textContent}"`;
+
+    // Include position if available
+    if (context.selectedElement.coords) {
+      const c = context.selectedElement.coords;
+      contextStr += ` at position (${c.x.toFixed(1)}, ${c.y.toFixed(1)}) on page ${c.page}, size ${c.width.toFixed(1)}x${c.height.toFixed(1)}px`;
+    }
+
+    contextStr += `]`;
+    message += `\n\n${contextStr}`;
   }
   // Note: documentHtml is used by scan_document tool, not included in user message (too large)
 
@@ -126,47 +209,90 @@ export function buildUserMessage(instruction: string, context: AgentContext): st
  * Build system prompt for the agent
  */
 export function buildSystemPrompt(context: AgentContext): string {
-  const contextInfo = context.selectedElement
-    ? `SELECTED ELEMENT:
+  let contextInfo = '';
+
+  if (context.selectedElement) {
+    contextInfo = `SELECTED ELEMENT:
 - ID: "${context.selectedElement.id}"
-- Content: "${context.selectedElement.textContent}"`
-    : `No selection. Use scan_document to find elements.`;
+- Content: "${context.selectedElement.textContent}"`;
 
-  return `You are Canon's document editing assistant. You help users edit PDF documents by calling tools.
+    // Add spatial info if available
+    if (context.selectedElement.coords) {
+      const c = context.selectedElement.coords;
+      contextInfo += `
+- Position: (${c.x.toFixed(1)}, ${c.y.toFixed(1)}) on page ${c.page}
+- Size: ${c.width.toFixed(1)} x ${c.height.toFixed(1)} pixels`;
+    }
+  } else {
+    contextInfo = `No element selected. Use scan_document to find elements.`;
+  }
 
-## Current Context
+  // Add page dimension context if available
+  if (context.pageInfo && context.pageInfo.length > 0) {
+    contextInfo += `\n\nPAGE DIMENSIONS:`;
+    context.pageInfo.forEach((p) => {
+      contextInfo += `\n- Page ${p.pageNum}: ${p.width.toFixed(0)} x ${p.height.toFixed(0)} pixels`;
+    });
+  }
+
+  return `You are Canon's document editing assistant. Help users edit PDF documents through natural language.
+
+## Context
 ${contextInfo}
 
-## Available Tools
+## Tools
 
 | Tool | Purpose |
 |------|---------|
-| set_element_text(elementId, text) | Replace element's entire text content |
-| redact_element(elementId) | Black out element completely |
-| highlight_element(elementId) | Add yellow highlight to element |
-| add_comment(elementId, text) | Attach annotation to element |
-| delete_element(elementId) | Remove element from document |
-| scan_document(query) | Search document for matching elements |
+| set_element_text(elementId, text) | Replace element's text |
+| redact_element(elementId) | Black out element |
+| highlight_element(elementId) | Yellow highlight |
+| add_comment(elementId, text) | Add annotation |
+| delete_element(elementId) | Remove element |
+| scan_document(query) | Find matching elements |
 
-## Core Principles
+## CRITICAL: Follow Instructions PRECISELY
 
-1. **Atomic Operations**: Each tool call operates on exactly ONE element. The elementId parameter accepts a single ID, never multiple.
+**Literal vs Semantic:**
+- "containing X" or "with the word X" = LITERAL match (only elements with exact word X)
+- "about X" or "related to X" = SEMANTIC match (broader interpretation)
+- "all X" without qualifier = use judgment, but prefer precision
 
-2. **Bulk Operations**: When modifying multiple elements, call the tool once per element. If scan_document returns N matches, you make N separate tool calls.
+**Examples:**
+- "redact text containing French" → scan for literal word "French" only (NOT "Francophone", "FR 101")
+- "redact text about French language" → broader: includes French courses, Francophone, etc.
+- "redact all email addresses" → pattern match: anything with @ in email format
 
-3. **Text Replacement**: The \`text\` parameter in set_element_text is the COMPLETE NEW content for that element. It fully replaces whatever was there before.
+**When UNCERTAIN, ASK:**
+If the user's instruction is ambiguous, ASK for clarification before acting. Examples:
+- "redact sensitive info" → Ask: "What counts as sensitive? Names, emails, phone numbers, financial data, or something specific?"
+- "fix the formatting" → Ask: "Which elements need formatting changes, and what style do you want?"
+- "clean this up" → Ask: "What specifically should I clean up or remove?"
 
-4. **Finding Elements**: Use scan_document when you need to locate elements. It returns element IDs and their current text content. Use those IDs in subsequent tool calls.
+Do NOT guess on ambiguous instructions. A quick question saves the user from unwanted changes.
 
-## Workflow
+## scan_document Usage
 
-For operations on selected element:
-→ Use the element ID from context directly
+Pass the query EXACTLY as the user specified. The scanner will interpret it:
+- User says "containing French" → scan_document("text containing the word French")
+- User says "email addresses" → scan_document("email addresses")
+- User says "Party B's info" → scan_document("information about or related to Party B")
 
-For operations requiring search:
-→ First call scan_document to find matching elements
-→ Then call the appropriate tool for each result
+Do NOT over-elaborate the query. Keep it close to user's words.
 
-## Response Style
-Be concise. Acknowledge briefly, then execute with tool calls.`;
+## Execution
+
+1. Each tool call = ONE element
+2. Bulk operations: N matches → N tool calls
+3. set_element_text REPLACES entire content
+
+## Conversation
+
+You have history. When users say:
+- "also the emails" → apply same operation to emails
+- "not that one" → refers to last operation
+- "what about X?" → same logic for X
+
+## Style
+Be concise. Acknowledge briefly, then execute. Ask only when truly ambiguous.`;
 }

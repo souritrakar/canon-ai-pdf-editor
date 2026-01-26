@@ -114,8 +114,17 @@ export function CommandCapsule({
 
   // Track operations count to detect changes
   const lastOpsLengthRef = useRef(0);
+  // Track if we just applied changes (to prevent re-adding operations)
+  const justAppliedRef = useRef(false);
 
   useEffect(() => {
+    // If we just applied changes, don't update messages from the operations prop change
+    if (justAppliedRef.current) {
+      justAppliedRef.current = false;
+      lastOpsLengthRef.current = 0;
+      return;
+    }
+
     // Nothing to show
     if (!explanation && operations.length === 0) {
       return;
@@ -225,10 +234,9 @@ export function CommandCapsule({
 
   const handleApply = useCallback((): void => {
     console.log("[CommandCapsule] handleApply called, onApplyChanges:", !!onApplyChanges);
-    if (onApplyChanges) {
-      console.log("[CommandCapsule] Calling onApplyChanges");
-      onApplyChanges();
-    }
+
+    // Set flag BEFORE calling parent's onApplyChanges to prevent the effect from re-adding operations
+    justAppliedRef.current = true;
 
     // Update the message to show applied state (remove operations from last message)
     setMessages(prev => {
@@ -248,6 +256,12 @@ export function CommandCapsule({
 
     // Reset the operations ref
     lastOpsLengthRef.current = 0;
+
+    // Now call parent to execute operations and clear state
+    if (onApplyChanges) {
+      console.log("[CommandCapsule] Calling onApplyChanges");
+      onApplyChanges();
+    }
   }, [onApplyChanges]);
 
   const handleDismiss = useCallback((): void => {

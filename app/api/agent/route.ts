@@ -1,14 +1,21 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import Groq from "groq-sdk";
 import { AGENT_TOOLS, type AgentOperation } from "@/lib/agent/tools";
 import { buildSystemPrompt, buildUserMessage, type AgentContext } from "@/lib/agent/context";
 import type { MessageParam, ContentBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources/messages";
 
 const anthropicClient = new Anthropic();
-const geminiClient = new GoogleGenerativeAI("AIzaSyDKlaTp56xw2sVE1DrKsRuG4SGDI9ol_hs");
+const geminiClient = new GoogleGenerativeAI("AIzaSyAgXPBHrKk4zMY-K7QrDc8NH_ZtjanK-Tc");
+const groqClient = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
-// Use Opus 4.5 for main reasoning, Gemini 2.5 Flash for document scanning
+// Use Opus 4.5 for main reasoning, Groq for fast scanning (with Gemini fallback for large docs)
 const MAIN_MODEL = "claude-opus-4-5-20251101";
+const GROQ_SCAN_MODEL = "llama-3.3-70b-versatile";
+// Groq context limit is ~128K tokens, roughly ~4 chars per token = ~500K chars safe limit
+const GROQ_CHAR_LIMIT = 400000;
 
 interface AgentRequest {
   instruction: string;
@@ -114,24 +121,8 @@ function extractTextFromElement(html: string, startPos: number): { text: string;
  * This allows for semantic queries like "redact all information pertaining to party B"
  */
 async function scanDocument(query: string, documentHtml: string): Promise<ScanResult[]> {
-  console.log(`\n🔍 [Scan] Using Gemini 2.5 Flash for: "${query}"`);
-  console.log(`📄 [Scan] Document HTML length: ${documentHtml.length} chars`);
-
-  // Debug: Check if data-canon-id exists in the HTML at all
-  const canonIdCount = (documentHtml.match(/data-canon-id/g) || []).length;
-  console.log(`🔎 [Scan] Found ${canonIdCount} data-canon-id attributes in HTML`);
-
-  // Debug: Show a sample of the HTML to see structure
-  const sampleStart = documentHtml.indexOf('data-canon-id');
-  if (sampleStart !== -1) {
-    console.log(`📋 [Scan] Sample HTML around first data-canon-id:`);
-    console.log(documentHtml.substring(Math.max(0, sampleStart - 50), sampleStart + 150));
-  } else {
-    console.log(`⚠️ [Scan] NO data-canon-id found in HTML!`);
-    // Show sample of document structure
-    console.log(`📋 [Scan] Sample of HTML structure:`);
-    console.log(documentHtml.substring(0, 2000));
-  }
+  console.log(`\n🔍 [SCAN] Starting document scan for query: "${query}"`);
+  console.log(`📄 [SCAN] Document HTML length: ${documentHtml.length} chars`);
 
   const elements: Array<{id: string, text: string, page: number}> = [];
 
@@ -158,33 +149,19 @@ async function scanDocument(query: string, documentHtml: string): Promise<ScanRe
     }
   }
 
-  console.log(`📋 [Scan] Found ${elements.length} elements with data-canon-id`);
-
-  // Log elements per page for debugging
-  const pageCount: Record<number, number> = {};
-  elements.forEach(e => {
-    pageCount[e.page] = (pageCount[e.page] || 0) + 1;
-  });
-  console.log(`📄 [Scan] Elements per page:`, pageCount);
-
-  // Log sample elements for debugging
+  console.log(`📋 [SCAN] Extracted ${elements.length} elements with text content`);
   if (elements.length > 0) {
-    console.log(`📋 [Scan] Sample elements:`);
-    elements.slice(0, 10).forEach((e, i) => {
-      console.log(`  ${i + 1}. [${e.id}] (page ${e.page}): "${e.text.substring(0, 60)}${e.text.length > 60 ? '...' : ''}"`);
-    });
+    console.log(`📋 [SCAN] Sample elements (first 5):`);
+    elements.slice(0, 5).forEach(e => console.log(`   - [${e.id}] "${e.text.substring(0, 50)}${e.text.length > 50 ? '...' : ''}"`));
   }
 
   if (elements.length === 0) {
-    console.log(`⚠️ [Scan] No elements found with data-canon-id`);
+    console.log(`⚠️ [SCAN] No elements found - returning empty`);
     return [];
   }
 
   // Create the FULL element list - NO TRUNCATION
-  // Gemini 2.5 Flash has a 1M token context window
   const elementList = elements.map(e => `[${e.id}] (page ${e.page}): "${e.text}"`).join('\n');
-
-  console.log(`📤 [Scan] Sending ${elements.length} elements to Gemini (${elementList.length} chars)`);
 
   const scanPrompt = `You are a document scanner for a PDF editor. Your task is to find ALL elements that match the user's query.
 
@@ -198,15 +175,20 @@ INSTRUCTIONS:
 2. Go through EVERY element in the list above
 3. Select ALL elements that match the query criteria
 4. Be THOROUGH and COMPREHENSIVE - do not miss any matches
-5. Use semantic understanding - for example:
-   - "redact all information about Party B" should match any element mentioning Party B, their name, address, etc.
-   - "redact text containing french" should match any element with "french" (case-insensitive) anywhere in it
-   - "find all email addresses" should match any element containing @ symbols in email format
+
+MATCHING GUIDELINES:
+- Pay close attention to the EXACT wording of the query
+- "containing [word]" or "with the word [X]" = LITERAL match - the exact word/phrase must appear
+  Example: "containing French" matches "French language" but NOT "Francophone" or "FR 101"
+- "about [topic]" or "related to [topic]" = SEMANTIC match - broader interpretation allowed
+  Example: "about Party B" matches mentions of Party B, their name, role, address, etc.
+- Pattern queries like "email addresses" or "phone numbers" = match the PATTERN format
+- When in doubt about literal vs semantic, prefer PRECISION over recall
 
 CRITICAL RULES:
 - Return ONLY element IDs that exist EXACTLY as shown in the list above (e.g., "pf1-el-42")
 - Do NOT invent, modify, or guess IDs
-- Return ALL matches - thoroughness is essential
+- Do NOT over-match - quality over quantity
 - If no matches exist, return an empty array
 
 RESPONSE FORMAT:
@@ -225,54 +207,86 @@ If no matches: []
 
 Return ONLY the JSON array, no other text or explanation.`;
 
+  // Decide which model to use based on document size
+  // Groq is faster but has ~128K token limit (~400K chars)
+  // Gemini has 1M token context for larger documents
+  const useGroq = elementList.length < GROQ_CHAR_LIMIT && process.env.GROQ_API_KEY;
+  console.log(`🤖 [SCAN] Using ${useGroq ? 'Groq (llama-3.3-70b)' : 'Gemini 2.5 Flash'} for scanning`);
+  console.log(`📏 [SCAN] Element list size: ${elementList.length} chars (limit: ${GROQ_CHAR_LIMIT})`);
+
   try {
-    const model = geminiClient.getGenerativeModel({ model: "gemini-2.5-flash" });
+    let responseText: string;
 
-    const result = await model.generateContent(scanPrompt);
-    const response = result.response;
-    const responseText = response.text();
-
-    console.log(`📥 [Scan] Gemini response length: ${responseText.length} chars`);
+    if (useGroq) {
+      console.log(`⏳ [SCAN] Calling Groq API...`);
+      const startTime = Date.now();
+      const completion = await groqClient.chat.completions.create({
+        model: GROQ_SCAN_MODEL,
+        messages: [{ role: "user", content: scanPrompt }],
+        temperature: 0.1,
+        max_tokens: 8000,
+      });
+      responseText = completion.choices[0]?.message?.content || "[]";
+      console.log(`✅ [SCAN] Groq responded in ${Date.now() - startTime}ms`);
+    } else {
+      console.log(`⏳ [SCAN] Calling Gemini API...`);
+      const startTime = Date.now();
+      const model = geminiClient.getGenerativeModel({ model: "gemini-2.5-flash" });
+      const result = await model.generateContent(scanPrompt);
+      responseText = result.response.text();
+      console.log(`✅ [SCAN] Gemini responded in ${Date.now() - startTime}ms`);
+    }
 
     // Parse the JSON response
     const jsonMatch = responseText.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
-      console.log("⚠️ [Scan] No JSON array found in Gemini response");
-      console.log("Response:", responseText.substring(0, 500));
+      console.log(`⚠️ [SCAN] No JSON array found in response`);
       return [];
     }
 
     const rawResults: ScanResult[] = JSON.parse(jsonMatch[0]);
-    console.log(`📊 [Scan] Gemini returned ${rawResults.length} matches`);
+    console.log(`📊 [SCAN] Raw results from LLM: ${rawResults.length} matches`);
 
     // Validate that returned IDs actually exist in our element list
     const validIds = new Set(elements.map(e => e.id));
     const seenIds = new Set<string>();
     const validResults = rawResults.filter(r => {
-      // Check if ID exists
       if (!validIds.has(r.elementId)) {
-        console.log(`⚠️ [Scan] Filtering out invalid ID: ${r.elementId}`);
+        console.log(`   ⚠️ Invalid ID filtered out: ${r.elementId}`);
         return false;
       }
-      // Check for duplicates
-      if (seenIds.has(r.elementId)) {
-        console.log(`⚠️ [Scan] Filtering out duplicate ID: ${r.elementId}`);
-        return false;
-      }
+      if (seenIds.has(r.elementId)) return false;
       seenIds.add(r.elementId);
       return true;
     });
 
-    console.log(`✅ [Scan] Found ${validResults.length} valid unique matches`);
+    console.log(`✅ [SCAN] Final valid results: ${validResults.length} matches`);
+    validResults.forEach(r => console.log(`   - [${r.elementId}] "${r.textContent.substring(0, 40)}${r.textContent.length > 40 ? '...' : ''}"`));
 
-    // Log all valid matches
-    validResults.forEach((m, i) => {
-      console.log(`  ${i + 1}. [${m.elementId}] (page ${m.page}): "${m.textContent.substring(0, 50)}..."`);
-    });
-
+    // Use validResults directly - no aggressive leaf filtering
+    // The LLM returns what it finds; we trust it and only filter invalid/duplicate IDs
     return validResults;
   } catch (error) {
-    console.error("❌ [Scan] Gemini error:", error);
+    console.error(`❌ [SCAN] Error:`, error);
+    // If Groq failed, try Gemini as fallback
+    if (useGroq) {
+      console.log(`🔄 [SCAN] Retrying with Gemini fallback...`);
+      try {
+        const model = geminiClient.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const result = await model.generateContent(scanPrompt);
+        const responseText = result.response.text();
+        const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          const rawResults: ScanResult[] = JSON.parse(jsonMatch[0]);
+          const validIds = new Set(elements.map(e => e.id));
+          const fallbackResults = rawResults.filter(r => validIds.has(r.elementId));
+          console.log(`✅ [SCAN] Gemini fallback succeeded: ${fallbackResults.length} matches`);
+          return fallbackResults;
+        }
+      } catch (fallbackError) {
+        console.error(`❌ [SCAN] Gemini fallback also failed:`, fallbackError);
+      }
+    }
     return [];
   }
 }
@@ -291,6 +305,7 @@ async function executeToolCall(
       return JSON.stringify({ error: "No document HTML provided for scanning", matches: [] });
     }
     const results = await scanDocument(query, documentHtml);
+
     return JSON.stringify({
       matches: results,
       count: results.length,
@@ -323,11 +338,6 @@ export async function POST(request: Request): Promise<Response> {
     const systemPrompt = buildSystemPrompt(context);
     const userMessage = buildUserMessage(instruction, context);
 
-    console.log("\n" + "=".repeat(60));
-    console.log("🤖 [Agent] NEW REQUEST");
-    console.log("📝 Instruction:", instruction);
-    console.log("=".repeat(60));
-
     // Stream response to client using SSE with agentic loop
     if (useStream) {
       const encoder = new TextEncoder();
@@ -340,8 +350,19 @@ export async function POST(request: Request): Promise<Response> {
               controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
             };
 
-            // Conversation history for agentic loop
-            const messages: MessageParam[] = [{ role: "user", content: userMessage }];
+            // Build messages from conversation history for multi-turn context
+            const messages: MessageParam[] = [];
+
+            // Add previous conversation turns (excluding the current instruction which is already in history)
+            if (context.conversationHistory && context.conversationHistory.length > 1) {
+              const previousMessages = context.conversationHistory.slice(0, -1);
+              for (const msg of previousMessages) {
+                messages.push({ role: msg.role, content: msg.content });
+              }
+            }
+
+            // Add current instruction with full context
+            messages.push({ role: "user", content: userMessage });
 
             // All operations collected across turns
             const allOperations: AgentOperation[] = [];
@@ -353,8 +374,6 @@ export async function POST(request: Request): Promise<Response> {
 
             while (turn < maxTurns) {
               turn++;
-              console.log(`\n--- Turn ${turn} ---`);
-              send("turn_start", { turn });
 
               const stream = anthropicClient.messages.stream({
                 model: MAIN_MODEL,
@@ -369,7 +388,6 @@ export async function POST(request: Request): Promise<Response> {
               let turnText = "";
 
               stream.on("text", (text) => {
-                process.stdout.write(text);
                 turnText += text;
                 send("text", { text });
               });
@@ -384,7 +402,6 @@ export async function POST(request: Request): Promise<Response> {
                     name: toolBlock.name,
                     inputJson: "",
                   });
-                  console.log(`\n🔧 [Tool] ${toolBlock.name}`);
                   // Don't send tool_start for scan_document - it runs server-side silently
                   if (toolBlock.name !== "scan_document") {
                     send("tool_start", { tool: toolBlock.name, id: toolBlock.id });
@@ -396,8 +413,6 @@ export async function POST(request: Request): Promise<Response> {
                   if (tool) {
                     try {
                       const input = tool.inputJson ? JSON.parse(tool.inputJson) : {};
-                      console.log(`✅ [Tool Complete] ${tool.name}:`, JSON.stringify(input));
-                      // Only send tool_complete for client-side tools, NOT scan_document
                       if (tool.name !== "scan_document") {
                         send("tool_complete", { tool: tool.name, id: tool.id, input });
                       }
@@ -445,11 +460,8 @@ export async function POST(request: Request): Promise<Response> {
                 }
               }
 
-              console.log(`\n📊 [Turn ${turn}] ${turnToolCalls.length} tool call(s), stop_reason: ${response.stop_reason}`);
-
               // If no tool calls or stop_reason is end_turn, we're done
               if (response.stop_reason === "end_turn" || turnToolCalls.length === 0) {
-                console.log("✅ [Agent] Completed - end_turn or no more tools");
                 break;
               }
 
@@ -475,16 +487,12 @@ export async function POST(request: Request): Promise<Response> {
               const toolResults: ToolResultBlockParam[] = [];
 
               for (const toolCall of turnToolCalls) {
-                console.log(`\n⚡ [Executing] ${toolCall.name}`);
-                send("tool_executing", { tool: toolCall.name, id: toolCall.id });
-
                 const result = await executeToolCall(
                   toolCall.name,
                   toolCall.input,
                   context.documentHtml
                 );
 
-                console.log(`📤 [Result] ${toolCall.name}:`, result.substring(0, 200));
                 send("tool_result", { tool: toolCall.name, id: toolCall.id, result: JSON.parse(result) });
 
                 toolResults.push({
@@ -498,11 +506,6 @@ export async function POST(request: Request): Promise<Response> {
               messages.push({ role: "user", content: toolResults });
             }
 
-            if (turn >= maxTurns) {
-              console.log("⚠️ [Agent] Hit max turns limit");
-            }
-
-            console.log(`\n📊 [Done] Total: ${allOperations.length} operation(s) across ${turn} turn(s)`);
 
             // Send final complete event
             send("complete", {
@@ -514,7 +517,6 @@ export async function POST(request: Request): Promise<Response> {
 
             controller.close();
           } catch (error) {
-            console.error("❌ Stream error:", error);
             const errorMsg = error instanceof Error ? error.message : "Unknown error";
             controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: errorMsg })}\n\n`));
             controller.close();
@@ -532,12 +534,22 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     // Non-streaming fallback (simplified - no agentic loop)
+    // Build messages with conversation history
+    const fallbackMessages: MessageParam[] = [];
+    if (context.conversationHistory && context.conversationHistory.length > 1) {
+      const previousMessages = context.conversationHistory.slice(0, -1);
+      for (const msg of previousMessages) {
+        fallbackMessages.push({ role: msg.role, content: msg.content });
+      }
+    }
+    fallbackMessages.push({ role: "user", content: userMessage });
+
     const response = await anthropicClient.messages.create({
       model: MAIN_MODEL,
       max_tokens: 2048,
       system: systemPrompt,
       tools: AGENT_TOOLS,
-      messages: [{ role: "user", content: userMessage }],
+      messages: fallbackMessages,
     });
 
     const operations: AgentOperation[] = [];

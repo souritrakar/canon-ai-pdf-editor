@@ -14,6 +14,7 @@ export {
   buildUserMessage,
   buildSystemPrompt,
   type AgentContext,
+  type ConversationMessage,
 } from "./context";
 
 export {

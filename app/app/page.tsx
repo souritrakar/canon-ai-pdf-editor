@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { PDFViewer, type PDFViewerRef, type SelectedElement, EditorToolbar, type EditorMode, PageThumbnails, CommandCapsule } from "@/components/editor";
-import { extractContext, executeOperations, type AgentOperation, type ExecutionResult } from "@/lib/agent";
+import { extractContext, executeOperations, type AgentOperation, type ExecutionResult, type ConversationMessage } from "@/lib/agent";
 
 export default function AppPage(): React.ReactElement {
   const [documentName, setDocumentName] = useState<string | null>(null);
@@ -20,6 +20,8 @@ export default function AppPage(): React.ReactElement {
   const [agentOperations, setAgentOperations] = useState<AgentOperation[]>([]);
   const [agentExplanation, setAgentExplanation] = useState("");
   const [agentError, setAgentError] = useState<string | null>(null);
+  // Conversation history for multi-turn context
+  const [conversationHistory, setConversationHistory] = useState<ConversationMessage[]>([]);
 
   // Change ledger: only tracks APPLIED changes (results of work)
   const [changeLedger, setChangeLedger] = useState<Array<{
@@ -62,6 +64,7 @@ export default function AppPage(): React.ReactElement {
         setPdfLoaded(true);
         setAgentOperations([]);
         setAgentExplanation("");
+        setConversationHistory([]); // Clear conversation for new document
       } catch (err) {
         console.error("Failed to convert PDF:", err);
         setError(err instanceof Error ? err.message : "Failed to convert PDF");
@@ -95,11 +98,14 @@ export default function AppPage(): React.ReactElement {
     pdfViewerRef.current?.clearSelection();
   }, []);
 
-  const handleExport = useCallback(async (): Promise<void> => {
+  const [showExportMenu, setShowExportMenu] = useState(false);
+
+  const handleExportPDF = useCallback(async (): Promise<void> => {
     const html = pdfViewerRef.current?.getHtml();
     if (!html) return;
 
     setIsExporting(true);
+    setShowExportMenu(false);
     try {
       const response = await fetch("/api/export", {
         method: "POST",
@@ -134,6 +140,24 @@ export default function AppPage(): React.ReactElement {
     }
   }, [documentName]);
 
+  const handleExportHTML = useCallback((): void => {
+    const html = pdfViewerRef.current?.getHtml();
+    if (!html) return;
+
+    setShowExportMenu(false);
+
+    // Create self-contained HTML with all interactive features preserved
+    const htmlBlob = new Blob([html], { type: "text/html" });
+    const url = URL.createObjectURL(htmlBlob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = documentName?.replace(/\.pdf$/i, "-edited.html") || "exported.html";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, [documentName]);
+
   // Submit instruction to AI agent with streaming
   const handleSubmit = useCallback(async (instructionText: string): Promise<void> => {
     if (!instructionText.trim()) return;
@@ -143,12 +167,20 @@ export default function AppPage(): React.ReactElement {
     setAgentOperations([]);
     setAgentExplanation("");
 
+    // Add user message to conversation history
+    const userMessage: ConversationMessage = { role: "user", content: instructionText };
+    const updatedHistory = [...conversationHistory, userMessage];
+    setConversationHistory(updatedHistory);
+
     try {
       // Extract context from current state
       const context = extractContext(
         selectedElement,
         pdfViewerRef.current?.getIframeRef() ?? null
       );
+
+      // Include conversation history in context
+      context.conversationHistory = updatedHistory;
 
       // Call agent API with streaming
       const response = await fetch("/api/agent", {
@@ -206,11 +238,6 @@ export default function AppPage(): React.ReactElement {
                   }
                   break;
 
-                case "tool_start":
-                  // Tool is starting - could show in UI
-                  console.log(`[Agent] Tool starting: ${data.tool}`);
-                  break;
-
                 case "tool_complete":
                   // Tool completed - add to operations
                   if (data.tool && data.id) {
@@ -221,28 +248,11 @@ export default function AppPage(): React.ReactElement {
                     };
                     collectedOperations.push(op);
                     setAgentOperations([...collectedOperations]);
-                    console.log(`[Agent] Tool complete: ${data.tool}`, data.input);
                   }
-                  break;
-
-                case "tool_executing":
-                  // Server is executing a tool (like scan_document)
-                  console.log(`[Agent] Executing: ${data.tool}`);
-                  break;
-
-                case "tool_result":
-                  // Result from server-executed tool
-                  console.log(`[Agent] Tool result: ${data.tool}`, data.result);
-                  break;
-
-                case "turn_start":
-                  // New turn in agentic loop
-                  console.log(`[Agent] Turn ${data.turn}`);
                   break;
 
                 case "complete":
                   // Final completion - use final operations array
-                  console.log(`[Agent] Complete:`, data);
                   if (data.operations && data.operations.length > 0) {
                     setAgentOperations(data.operations);
                   }
@@ -274,13 +284,18 @@ export default function AppPage(): React.ReactElement {
         }
       }
 
+      // Add assistant response to conversation history
+      if (streamedText.trim()) {
+        setConversationHistory(prev => [...prev, { role: "assistant", content: streamedText.trim() }]);
+      }
+
     } catch (err) {
       console.error("Agent error:", err);
       setAgentError(err instanceof Error ? err.message : "Failed to process instruction");
     } finally {
       setIsProcessing(false);
     }
-  }, [selectedElement]);
+  }, [selectedElement, conversationHistory]);
 
   // Apply operations when user confirms
   const handleApplyChanges = useCallback(async (): Promise<void> => {
@@ -385,6 +400,14 @@ export default function AppPage(): React.ReactElement {
     };
   }, [documentName, isConverting]);
 
+  // Close export menu when clicking outside
+  useEffect(() => {
+    if (!showExportMenu) return;
+    const handleClickOutside = (): void => setShowExportMenu(false);
+    document.addEventListener("click", handleClickOutside);
+    return () => document.removeEventListener("click", handleClickOutside);
+  }, [showExportMenu]);
+
   return (
     <div className="flex h-screen bg-background overflow-hidden">
       {/* Hidden file input */}
@@ -430,6 +453,24 @@ export default function AppPage(): React.ReactElement {
               </div>
             )}
           </div>
+
+          {/* Selected Element Info */}
+          {selectedElement && (
+            <div className="mt-4 p-3 rounded-lg bg-teal-50 border border-teal-200">
+              <p className="text-xs font-semibold text-teal-700 mb-1">Selected Element</p>
+              <p className="text-xs font-mono text-teal-900 break-all select-all">
+                {selectedElement.id}
+              </p>
+              {selectedElement.count && selectedElement.count > 1 && (
+                <p className="text-xs text-teal-600 mt-1">
+                  +{selectedElement.count - 1} more selected
+                </p>
+              )}
+              <p className="text-xs text-teal-600 mt-2 line-clamp-3">
+                {selectedElement.textContent}
+              </p>
+            </div>
+          )}
         </div>
 
         <div className="p-4 border-t border-border">
@@ -461,36 +502,71 @@ export default function AppPage(): React.ReactElement {
             )}
           </div>
           {documentName && !isConverting && (
-            <Button
-              onClick={handleExport}
-              disabled={isExporting}
-              variant="outline"
-              className="flex items-center gap-2"
-            >
-              {isExporting ? (
-                <>
-                  <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-                  Exporting...
-                </>
-              ) : (
-                <>
-                  <svg
-                    className="w-4 h-4"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
+            <div className="relative">
+              <Button
+                onClick={(e) => { e.stopPropagation(); setShowExportMenu(!showExportMenu); }}
+                disabled={isExporting}
+                variant="outline"
+                className="flex items-center gap-2"
+              >
+                {isExporting ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                    Exporting...
+                  </>
+                ) : (
+                  <>
+                    <svg
+                      className="w-4 h-4"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+                      />
+                    </svg>
+                    Export
+                    <svg
+                      className="w-3 h-3 ml-1"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </>
+                )}
+              </Button>
+              {showExportMenu && (
+                <div className="absolute right-0 mt-2 w-48 bg-white rounded-lg shadow-lg border border-gray-200 py-1 z-50">
+                  <button
+                    onClick={handleExportPDF}
+                    className="w-full px-4 py-2 text-left text-sm hover:bg-gray-100 flex items-center gap-2"
                   >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
-                    />
-                  </svg>
-                  Export PDF
-                </>
+                    <svg className="w-4 h-4 text-red-500" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zM6 20V4h7v5h5v11H6z"/>
+                      <path d="M8 12h8v2H8zm0 3h8v2H8z"/>
+                    </svg>
+                    Export as PDF
+                  </button>
+                  <button
+                    onClick={handleExportHTML}
+                    className="w-full px-4 py-2 text-left text-sm hover:bg-gray-100 flex items-center gap-2"
+                  >
+                    <svg className="w-4 h-4 text-orange-500" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/>
+                    </svg>
+                    Export as HTML
+                    <span className="text-xs text-gray-400 ml-auto">Interactive</span>
+                  </button>
+                </div>
               )}
-            </Button>
+            </div>
           )}
         </div>
 
