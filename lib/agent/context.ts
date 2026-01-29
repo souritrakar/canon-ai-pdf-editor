@@ -288,7 +288,7 @@ Do NOT over-elaborate the query. Keep it close to user's words.
 
 ## Conversation
 
-You have history. When users say:
+You have history. You must analyze the user instruction to understand the conversational context and what they are referring to. For example, when users say:
 - "also the emails" → apply same operation to emails
 - "not that one" → refers to last operation
 - "what about X?" → same logic for X
