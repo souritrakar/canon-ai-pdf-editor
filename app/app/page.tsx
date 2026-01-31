@@ -4,6 +4,8 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { PDFViewer, type PDFViewerRef, type SelectedElement, EditorToolbar, type EditorMode, PageThumbnails, CommandCapsule } from "@/components/editor";
 import { extractContext, executeOperations, type AgentOperation, type ExecutionResult, type ConversationMessage } from "@/lib/agent";
+import { buildGDSM } from "@/lib/gdsm";
+import { cn } from "@/lib/utils";
 
 export default function AppPage(): React.ReactElement {
   const [documentName, setDocumentName] = useState<string | null>(null);
@@ -34,6 +36,17 @@ export default function AppPage(): React.ReactElement {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pdfViewerRef = useRef<PDFViewerRef>(null);
+
+  // Helper to build and log GDSM
+  const logGDSM = useCallback(() => {
+    const iframeRef = pdfViewerRef.current?.getIframeRef();
+    const iframeDoc = iframeRef?.current?.contentDocument;
+    if (iframeDoc) {
+      const gdsm = buildGDSM(iframeDoc);
+      const elementsArray = Array.from(gdsm.elementsById.values());
+      console.log("[GDSM] All elements:", elementsArray);
+    }
+  }, []);
 
   const handleFileUpload = useCallback(
     async (event: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
@@ -182,6 +195,24 @@ export default function AppPage(): React.ReactElement {
       // Include conversation history in context
       context.conversationHistory = updatedHistory;
 
+      // Build GDSM and include elements for scanner
+      const iframeRef = pdfViewerRef.current?.getIframeRef();
+      const iframeDoc = iframeRef?.current?.contentDocument;
+      if (iframeDoc) {
+        const gdsm = buildGDSM(iframeDoc);
+        context.gdsmElements = Array.from(gdsm.elementsById.values()).map(el => ({
+          id: el.id,
+          text: el.text,
+          page: el.page,
+          x: el.x,
+          y: el.y,
+          width: el.width,
+          height: el.height,
+          state: el.state,
+          semanticType: el.semanticType,
+        }));
+      }
+
       // Call agent API with streaming
       const response = await fetch("/api/agent", {
         method: "POST",
@@ -235,6 +266,14 @@ export default function AppPage(): React.ReactElement {
                   if (data.text) {
                     streamedText += data.text;
                     setAgentExplanation(streamedText);
+                  }
+                  break;
+
+                case "tool_result":
+                  // Scanner results - log what was found
+                  if (data.tool === "scan_document" && data.result) {
+                    console.log("[Scanner] Found elements:", data.result.matches);
+                    console.log("[Scanner] Count:", data.result.count);
                   }
                   break;
 
@@ -358,7 +397,10 @@ export default function AppPage(): React.ReactElement {
     setAgentOperations([]);
     setAgentExplanation("");
     handleClearSelection();
-  }, [agentOperations, handleClearSelection]);
+
+    // Log updated GDSM after changes
+    setTimeout(logGDSM, 100);
+  }, [agentOperations, handleClearSelection, logGDSM]);
 
   // Dismiss operations without applying
   const handleDismissChanges = useCallback((): void => {
@@ -407,6 +449,13 @@ export default function AppPage(): React.ReactElement {
     document.addEventListener("click", handleClickOutside);
     return () => document.removeEventListener("click", handleClickOutside);
   }, [showExportMenu]);
+
+  // Build and log GDSM when PDF is loaded
+  useEffect(() => {
+    if (!pdfLoaded) return;
+    const timer = setTimeout(logGDSM, 500);
+    return () => clearTimeout(timer);
+  }, [pdfLoaded, logGDSM]);
 
   return (
     <div className="flex h-screen bg-background overflow-hidden">

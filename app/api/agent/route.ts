@@ -2,11 +2,11 @@ import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import { AGENT_TOOLS, type AgentOperation } from "@/lib/agent/tools";
-import { buildSystemPrompt, buildUserMessage, type AgentContext } from "@/lib/agent/context";
+import { buildSystemPrompt, buildUserMessage, type AgentContext, type GDSMElementForScanner } from "@/lib/agent/context";
 import type { MessageParam, ContentBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources/messages";
 
 const anthropicClient = new Anthropic();
-const geminiClient = new GoogleGenerativeAI("AIzaSyAgXPBHrKk4zMY-K7QrDc8NH_ZtjanK-Tc");
+const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 const groqClient = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
@@ -30,140 +30,62 @@ interface ScanResult {
 }
 
 /**
- * Extract text content from an HTML element, handling nested tags properly
- */
-function extractTextFromElement(html: string, startPos: number): { text: string; endPos: number } | null {
-  // Find the tag name
-  const tagNameMatch = html.substring(startPos + 1).match(/^(\w+)/);
-  if (!tagNameMatch) return null;
-  const tagName = tagNameMatch[1];
-
-  // Find end of opening tag
-  const openTagEnd = html.indexOf('>', startPos);
-  if (openTagEnd === -1) return null;
-
-  // Check for self-closing tag
-  if (html[openTagEnd - 1] === '/') {
-    return { text: '', endPos: openTagEnd + 1 };
-  }
-
-  // Find matching closing tag, accounting for nested same-name tags
-  let depth = 1;
-  let pos = openTagEnd + 1;
-  const openPattern = new RegExp(`<${tagName}[\\s>]`, 'gi');
-  const closePattern = `</${tagName}>`;
-
-  while (depth > 0 && pos < html.length) {
-    const nextClose = html.indexOf(closePattern, pos);
-    if (nextClose === -1) break;
-
-    // Check for any opens between current pos and next close
-    openPattern.lastIndex = pos;
-    let nextOpen = openPattern.exec(html);
-    while (nextOpen && nextOpen.index < nextClose) {
-      depth++;
-      nextOpen = openPattern.exec(html);
-    }
-
-    depth--;
-    pos = nextClose + closePattern.length;
-
-    if (depth === 0) {
-      const content = html.substring(openTagEnd + 1, nextClose);
-      // Strip all HTML tags to get plain text
-      let text = content.replace(/<[^>]*>/g, '').trim();
-
-      // Normalize whitespace (multiple spaces → single space)
-      text = text.replace(/\s+/g, ' ');
-
-      // Fix for pdf2htmlEX: sometimes text is duplicated due to nested structure
-      // This happens because parent elements contain their children's text too
-
-      // Method 1: Check for direct string repetition with space/separator
-      // e.g., "FR 201 FR 201" or "Grade 10  Grade 10"
-      const halfLen = Math.floor(text.length / 2);
-      if (text.length >= 4) {
-        // Try to find if text is "X X" pattern (same text repeated)
-        for (let i = halfLen - 1; i <= halfLen + 1 && i > 0 && i < text.length; i++) {
-          const firstPart = text.substring(0, i).trim();
-          const secondPart = text.substring(i).trim();
-          if (firstPart === secondPart && firstPart.length > 0) {
-            text = firstPart;
-            break;
-          }
-        }
-      }
-
-      // Method 2: Word-based deduplication as fallback
-      // e.g., "Hello World Hello World" → "Hello World"
-      const words = text.split(/\s+/).filter(w => w.length > 0);
-      if (words.length >= 2 && words.length % 2 === 0) {
-        const half = words.length / 2;
-        const firstHalf = words.slice(0, half).join(' ');
-        const secondHalf = words.slice(half).join(' ');
-        if (firstHalf === secondHalf) {
-          text = firstHalf;
-        }
-      }
-
-      return { text, endPos: pos };
-    }
-  }
-
-  return null;
-}
-
-/**
- * Use Gemini 2.5 Flash to intelligently scan document and find matching elements
+ * Use LLM to intelligently scan GDSM and find matching elements
  *
- * Strategy: Extract ALL text-bearing elements from the PDF HTML, then use Gemini
- * to intelligently understand the query and find relevant elements.
- * This allows for semantic queries like "redact all information pertaining to party B"
+ * Strategy: Use pre-built GDSM elements (with positions/coordinates) instead of parsing HTML.
+ * This is more efficient and includes spatial data for better context.
  */
-async function scanDocument(query: string, documentHtml: string): Promise<ScanResult[]> {
-  console.log(`\n🔍 [SCAN] Starting document scan for query: "${query}"`);
-  console.log(`📄 [SCAN] Document HTML length: ${documentHtml.length} chars`);
+async function scanDocument(query: string, gdsmElements: GDSMElementForScanner[]): Promise<ScanResult[]> {
+  console.log(`\n🔍 [SCAN] Starting GDSM scan for query: "${query}"`);
+  console.log(`📋 [SCAN] GDSM elements: ${gdsmElements.length}`);
 
-  const elements: Array<{id: string, text: string, page: number}> = [];
-
-  // Extract ALL elements with data-canon-id attribute
-  const idPattern = /data-canon-id="([^"]+)"/g;
-  let match;
-
-  while ((match = idPattern.exec(documentHtml)) !== null) {
-    const id = match[1];
-
-    // Find the opening tag start (go back to find <)
-    let tagStart = match.index;
-    while (tagStart > 0 && documentHtml[tagStart] !== '<') {
-      tagStart--;
-    }
-
-    // Find the element's text content
-    const result = extractTextFromElement(documentHtml, tagStart);
-    if (result && result.text.length > 0) {
-      // Extract page number from ID (format: pf1-el-42)
-      const pageMatch = id.match(/^pf(\d+)/);
-      const page = pageMatch ? parseInt(pageMatch[1], 10) : 1;
-      elements.push({ id, text: result.text, page });
-    }
-  }
-
-  console.log(`📋 [SCAN] Extracted ${elements.length} elements with text content`);
-  if (elements.length > 0) {
-    console.log(`📋 [SCAN] Sample elements (first 5):`);
-    elements.slice(0, 5).forEach(e => console.log(`   - [${e.id}] "${e.text.substring(0, 50)}${e.text.length > 50 ? '...' : ''}"`));
-  }
-
-  if (elements.length === 0) {
-    console.log(`⚠️ [SCAN] No elements found - returning empty`);
+  if (gdsmElements.length === 0) {
+    console.log(`⚠️ [SCAN] No elements in GDSM - returning empty`);
     return [];
   }
 
-  // Create the FULL element list - NO TRUNCATION
-  const elementList = elements.map(e => `[${e.id}] (page ${e.page}): "${e.text}"`).join('\n');
+  // Log sample elements
+  console.log(`📋 [SCAN] Sample elements (first 5):`);
+  gdsmElements.slice(0, 5).forEach(e =>
+    console.log(`   - [${e.id}] p${e.page} (${e.x.toFixed(0)},${e.y.toFixed(0)}) "${e.text.substring(0, 50)}${e.text.length > 50 ? '...' : ''}"`)
+  );
+
+  // Create element list with coordinates for spatial context
+  const elementList = gdsmElements.map(e => {
+    const pos = `(${e.x.toFixed(0)},${e.y.toFixed(0)}) ${e.width.toFixed(0)}x${e.height.toFixed(0)}`;
+    const type = e.semanticType ? ` [${e.semanticType}]` : '';
+    return `[${e.id}] page ${e.page} | pos: ${pos}${type}: "${e.text}"`;
+  }).join('\n');
+
+  // Log what we're sending to LLM
+  const lines = elementList.split('\n');
+  console.log(`📤 [SCAN] Sending ${lines.length} elements to LLM (${elementList.length} chars)`);
+  console.log(`📤 [SCAN] First element: ${lines[0]}`);
+  console.log(`📤 [SCAN] Last element: ${lines[lines.length - 1]}`);
+
+  // For debugging: check local regex matches to compare with LLM
+  const wordMatch = query.match(/containing (?:the word )?['"']?(\w+)['"']?/i);
+  if (wordMatch) {
+    const word = wordMatch[1];
+    const regexMatches = gdsmElements.filter(e =>
+      new RegExp(`\\b${word}\\b`, 'i').test(e.text)
+    );
+    console.log(`🔬 [SCAN] Regex found ${regexMatches.length} matches for "${word}":`);
+    regexMatches.forEach(e => console.log(`   - [${e.id}] "${e.text.substring(0, 60)}"`));
+  }
 
   const scanPrompt = `You are a document scanner for a PDF editor. Your task is to find ALL elements that match the user's query.
+
+## DATA SOURCE: Global Document Structure Model (GDSM)
+
+You are given the GDSM - a structured representation of all document elements with:
+- **Element ID**: Unique identifier (e.g., "pf1-el-42")
+- **Page number**: Which page the element is on
+- **Position**: (x, y) coordinates and width x height in pixels (page-relative)
+- **Semantic type**: Auto-detected type like [email], [phone], [date], etc.
+- **Text content**: The actual text in the element
+
+This spatial data allows you to understand document layout (headers at top, footers at bottom, columns, etc.).
 
 USER QUERY: "${query}"
 
@@ -171,24 +93,50 @@ DOCUMENT ELEMENTS (format: [element_id] (page N): "text content"):
 ${elementList}
 
 INSTRUCTIONS:
-1. Analyze the user's query to understand what they want to find
+1. Analyze the user's query to understand EXACTLY what they want to find
 2. Go through EVERY element in the list above
 3. Select ALL elements that match the query criteria
-4. Be THOROUGH and COMPREHENSIVE - do not miss any matches
+4. Be THOROUGH but PRECISE - match what the user asked for, not more
 
-MATCHING GUIDELINES:
-- Pay close attention to the EXACT wording of the query
-- "containing [word]" or "with the word [X]" = LITERAL match - the exact word/phrase must appear
-  Example: "containing French" matches "French language" but NOT "Francophone" or "FR 101"
-- "about [topic]" or "related to [topic]" = SEMANTIC match - broader interpretation allowed
-  Example: "about Party B" matches mentions of Party B, their name, role, address, etc.
-- Pattern queries like "email addresses" or "phone numbers" = match the PATTERN format
-- When in doubt about literal vs semantic, prefer PRECISION over recall
+## MATCHING RULES (CRITICAL - READ CAREFULLY)
 
-CRITICAL RULES:
-- Return ONLY element IDs that exist EXACTLY as shown in the list above (e.g., "pf1-el-42")
+### EXACT WORD MATCHING (Default for "containing", "with the word", etc.)
+When the user asks for elements containing a specific word, match the EXACT WORD as a standalone token:
+- A word is standalone if it's surrounded by spaces, punctuation, or line boundaries
+- Do NOT match the word as a SUBSTRING of a longer word
+
+EXAMPLES of EXACT WORD matching:
+| Query: "containing French" | Text | Match? | Reason |
+|---------------------------|------|--------|--------|
+| | "French language" | ✅ YES | "French" is a standalone word |
+| | "in French" | ✅ YES | "French" is a standalone word |
+| | "French" | ✅ YES | "French" is the entire text |
+| | "Francophone" | ❌ NO | "French" is a substring, not standalone |
+| | "Frenchman" | ❌ NO | "French" is a prefix, not standalone |
+| | "FR 101" | ❌ NO | "FR" is not "French" |
+
+| Query: "containing phone" | Text | Match? | Reason |
+|---------------------------|------|--------|--------|
+| | "phone number" | ✅ YES | "phone" is standalone |
+| | "smartphone" | ❌ NO | "phone" is a suffix, not standalone |
+| | "telephone" | ❌ NO | "phone" is a suffix, not standalone |
+
+### SEMANTIC MATCHING (For "about", "related to", "regarding")
+When the user asks for content ABOUT or RELATED TO a topic, use broader interpretation:
+- Match direct mentions AND contextually related content
+- Example: "about Party B" matches "John Smith (Party B)", "the Buyer's address", etc.
+
+### PATTERN MATCHING (For formats like emails, phones, dates)
+Match the FORMAT/PATTERN, not a literal word:
+- "email addresses" → match patterns like "user@domain.com"
+- "phone numbers" → match patterns like "(555) 123-4567" or "555-123-4567"
+- "dates" → match patterns like "January 5, 2024" or "01/05/2024"
+
+## VALIDATION RULES
+- Return ONLY element IDs that exist EXACTLY as shown in the list above
 - Do NOT invent, modify, or guess IDs
-- Do NOT over-match - quality over quantity
+- Do NOT over-match - precision is more important than recall
+- If unsure whether something matches, do NOT include it
 - If no matches exist, return an empty array
 
 RESPONSE FORMAT:
@@ -211,7 +159,7 @@ Return ONLY the JSON array, no other text or explanation.`;
   // Groq is faster but has ~128K token limit (~400K chars)
   // Gemini has 1M token context for larger documents
   const useGroq = elementList.length < GROQ_CHAR_LIMIT && process.env.GROQ_API_KEY;
-  console.log(`🤖 [SCAN] Using ${useGroq ? 'Groq (llama-3.3-70b)' : 'Gemini 2.5 Flash'} for scanning`);
+  console.log(`🤖 [SCAN] Using ${useGroq ? 'Groq (llama-3.3-70b)' : 'Gemini 2.0 Flash'} for scanning`);
   console.log(`📏 [SCAN] Element list size: ${elementList.length} chars (limit: ${GROQ_CHAR_LIMIT})`);
 
   try {
@@ -231,7 +179,7 @@ Return ONLY the JSON array, no other text or explanation.`;
     } else {
       console.log(`⏳ [SCAN] Calling Gemini API...`);
       const startTime = Date.now();
-      const model = geminiClient.getGenerativeModel({ model: "gemini-2.5-flash" });
+      const model = geminiClient.getGenerativeModel({ model: "gemini-3-flash-preview" });
       const result = await model.generateContent(scanPrompt);
       responseText = result.response.text();
       console.log(`✅ [SCAN] Gemini responded in ${Date.now() - startTime}ms`);
@@ -247,8 +195,8 @@ Return ONLY the JSON array, no other text or explanation.`;
     const rawResults: ScanResult[] = JSON.parse(jsonMatch[0]);
     console.log(`📊 [SCAN] Raw results from LLM: ${rawResults.length} matches`);
 
-    // Validate that returned IDs actually exist in our element list
-    const validIds = new Set(elements.map(e => e.id));
+    // Validate that returned IDs actually exist in our GDSM
+    const validIds = new Set(gdsmElements.map(e => e.id));
     const seenIds = new Set<string>();
     const validResults = rawResults.filter(r => {
       if (!validIds.has(r.elementId)) {
@@ -263,8 +211,6 @@ Return ONLY the JSON array, no other text or explanation.`;
     console.log(`✅ [SCAN] Final valid results: ${validResults.length} matches`);
     validResults.forEach(r => console.log(`   - [${r.elementId}] "${r.textContent.substring(0, 40)}${r.textContent.length > 40 ? '...' : ''}"`));
 
-    // Use validResults directly - no aggressive leaf filtering
-    // The LLM returns what it finds; we trust it and only filter invalid/duplicate IDs
     return validResults;
   } catch (error) {
     console.error(`❌ [SCAN] Error:`, error);
@@ -272,13 +218,13 @@ Return ONLY the JSON array, no other text or explanation.`;
     if (useGroq) {
       console.log(`🔄 [SCAN] Retrying with Gemini fallback...`);
       try {
-        const model = geminiClient.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const model = geminiClient.getGenerativeModel({ model: "gemini-2.0-flash" });
         const result = await model.generateContent(scanPrompt);
         const responseText = result.response.text();
         const jsonMatch = responseText.match(/\[[\s\S]*\]/);
         if (jsonMatch) {
           const rawResults: ScanResult[] = JSON.parse(jsonMatch[0]);
-          const validIds = new Set(elements.map(e => e.id));
+          const validIds = new Set(gdsmElements.map(e => e.id));
           const fallbackResults = rawResults.filter(r => validIds.has(r.elementId));
           console.log(`✅ [SCAN] Gemini fallback succeeded: ${fallbackResults.length} matches`);
           return fallbackResults;
@@ -297,14 +243,14 @@ Return ONLY the JSON array, no other text or explanation.`;
 async function executeToolCall(
   toolName: string,
   toolInput: Record<string, unknown>,
-  documentHtml?: string
+  gdsmElements?: GDSMElementForScanner[]
 ): Promise<string> {
   if (toolName === "scan_document") {
     const query = toolInput.query as string;
-    if (!documentHtml) {
-      return JSON.stringify({ error: "No document HTML provided for scanning", matches: [] });
+    if (!gdsmElements || gdsmElements.length === 0) {
+      return JSON.stringify({ error: "No GDSM elements provided for scanning", matches: [] });
     }
-    const results = await scanDocument(query, documentHtml);
+    const results = await scanDocument(query, gdsmElements);
 
     return JSON.stringify({
       matches: results,
@@ -490,7 +436,7 @@ export async function POST(request: Request): Promise<Response> {
                 const result = await executeToolCall(
                   toolCall.name,
                   toolCall.input,
-                  context.documentHtml
+                  context.gdsmElements
                 );
 
                 send("tool_result", { tool: toolCall.name, id: toolCall.id, result: JSON.parse(result) });
