@@ -30,14 +30,284 @@ interface ScanResult {
 }
 
 /**
+ * Result from contextual search LLM - specific search criteria
+ */
+interface ContextualSearchResult {
+  searchCriteria: string;
+  resolvedEntities: Array<{
+    reference: string;
+    resolvedTo: string;
+    context: string;
+  }>;
+  targetContent: string[];
+  strategy: string;
+}
+
+/**
+ * Extract plain text from GDSM elements for contextual understanding
+ * Organizes text by page without element IDs - just the content
+ */
+function extractPlainText(gdsmElements: GDSMElementForScanner[]): string {
+  if (!gdsmElements || gdsmElements.length === 0) return "";
+
+  // Group elements by page
+  const pageMap = new Map<number, GDSMElementForScanner[]>();
+  gdsmElements.forEach(el => {
+    const elements = pageMap.get(el.page) || [];
+    elements.push(el);
+    pageMap.set(el.page, elements);
+  });
+
+  // Sort pages and build text
+  const sortedPages = Array.from(pageMap.keys()).sort((a, b) => a - b);
+
+  let text = "";
+  for (const pageNum of sortedPages) {
+    const pageElements = pageMap.get(pageNum) || [];
+    // Sort elements by y position (top to bottom) then x (left to right)
+    pageElements.sort((a, b) => {
+      if (Math.abs(a.y - b.y) < 5) return a.x - b.x; // Same line
+      return a.y - b.y;
+    });
+
+    text += `\n--- Page ${pageNum} ---\n`;
+
+    let lastY = -1;
+    for (const el of pageElements) {
+      // Add newline if significant y-distance (new line)
+      if (lastY !== -1 && Math.abs(el.y - lastY) > 10) {
+        text += "\n";
+      } else if (lastY !== -1) {
+        text += " ";
+      }
+      text += el.text;
+      lastY = el.y;
+    }
+  }
+
+  return text.trim();
+}
+
+/**
+ * Detect if a query needs contextual resolution
+ * These are queries with entity references, relational terms, or semantic complexity
+ */
+function needsContextualResolution(query: string): boolean {
+  const contextualPatterns = [
+    // Entity references
+    /party\s+[a-z]/i,                    // "Party A", "Party B"
+    /the\s+(buyer|seller|vendor|client|contractor|employee|employer)/i,
+    /\b(their|his|her|its)\s+\w+/i,      // Possessive references
+    /\bmy\s+\w+/i,                        // "my projects", "my experience"
+
+    // Relational/semantic queries
+    /related\s+to/i,
+    /associated\s+with/i,
+    /information\s+(about|regarding|concerning)/i,
+    /belongs?\s+to/i,
+    /owned\s+by/i,
+
+    // Financial/legal terms that need context
+    /financial\s+(information|data|details|records)/i,
+    /confidential\s+\w+/i,
+    /sensitive\s+\w+/i,
+    /personal\s+\w+/i,
+
+    // References that need document understanding
+    /the\s+(company|organization|firm|corporation)/i,
+    /\b(first|second|third)\s+(party|company|section)/i,
+  ];
+
+  return contextualPatterns.some(pattern => pattern.test(query));
+}
+
+/**
+ * Contextual Search LLM - Understands document content and resolves entities
+ *
+ * This is the first pass in the two-pass architecture:
+ * 1. Contextual Search LLM (this): Reads plain text, understands context, resolves entities
+ * 2. Scanner LLM: Searches GDSM with element IDs to find specific matches
+ */
+async function resolveContextualQuery(
+  query: string,
+  plainText: string
+): Promise<ContextualSearchResult | null> {
+  console.log(`\n🧠 [CONTEXT] Starting contextual query resolution`);
+  console.log(`📝 [CONTEXT] Original query: "${query}"`);
+  console.log(`📄 [CONTEXT] Document text: ${plainText.length} chars`);
+
+  // Truncate very long documents for the contextual LLM
+  const MAX_CONTEXT_LENGTH = 50000; // ~12.5K tokens
+  const truncatedText = plainText.length > MAX_CONTEXT_LENGTH
+    ? plainText.substring(0, MAX_CONTEXT_LENGTH) + "\n\n[... document truncated ...]"
+    : plainText;
+
+  const contextualPrompt = `<contextual_search_llm>
+
+<role>
+You are the Contextual Search LLM in a two-pass document search system.
+Your job is to READ and UNDERSTAND the document, then provide SPECIFIC search criteria for the Scanner LLM.
+</role>
+
+<task>
+Given a user's query and document content:
+1. READ the entire document to understand its structure, entities, and relationships
+2. IDENTIFY who/what the query refers to (entity resolution)
+3. OUTPUT specific, concrete search criteria that reference ACTUAL content from the document
+</task>
+
+<user_query>${query}</user_query>
+
+<document_content>
+${truncatedText}
+</document_content>
+
+<entity_resolution_rules>
+When the query contains entity references, you MUST resolve them:
+
+- "Party A" / "Party B" → Find actual names (e.g., "Acme Corporation", "John Smith")
+- "the Buyer" / "the Seller" → Find who is playing that role in the document
+- "my projects" → Identify project names mentioned
+- "their financial information" → Identify whose finances AND what specific financial data appears
+- "the company" → Identify which company is referenced in context
+</entity_resolution_rules>
+
+<output_format>
+Return a JSON object with these fields:
+
+{
+  "searchCriteria": "A detailed, specific description for the Scanner LLM. Reference ACTUAL content from the document.",
+
+  "resolvedEntities": [
+    {
+      "reference": "Party B",
+      "resolvedTo": "Acme Corporation",
+      "context": "Identified as the Buyer in the contract header"
+    }
+  ],
+
+  "targetContent": [
+    "Specific text or patterns to find",
+    "For example: '$50,000', 'Acme Corporation', 'Payment Terms'"
+  ],
+
+  "strategy": "Brief explanation of search strategy"
+}
+</output_format>
+
+<examples>
+
+<example>
+Query: "redact Party B's financial information"
+Document contains: "AGREEMENT between TechStart Inc. (Party A, the Seller) and Acme Corporation (Party B, the Buyer). Purchase Price: $500,000. Payment Schedule: 50% upfront, 50% on delivery."
+
+Output:
+{
+  "searchCriteria": "Find all financial information related to Acme Corporation (identified as Party B/the Buyer). This includes: dollar amounts like '$500,000', payment terms, percentages like '50%', and any text mentioning purchase price, payment schedule, or payment terms.",
+  "resolvedEntities": [
+    {"reference": "Party B", "resolvedTo": "Acme Corporation", "context": "Defined in agreement header as 'Party B, the Buyer'"}
+  ],
+  "targetContent": ["$500,000", "50%", "Acme Corporation", "Payment Schedule", "Purchase Price"],
+  "strategy": "Search for resolved entity name and all monetary/payment content associated with their role as Buyer"
+}
+</example>
+
+<example>
+Query: "highlight my project names"
+Document contains: "PROJECTS: DataViz Pro - Analytics dashboard... CloudSync - File synchronization... Resume Builder - AI-powered resume tool"
+
+Output:
+{
+  "searchCriteria": "Find project names which appear as capitalized titles, typically formatted as 'Name - Description'. Specific projects to find: 'DataViz Pro', 'CloudSync', 'Resume Builder'",
+  "resolvedEntities": [],
+  "targetContent": ["DataViz Pro", "CloudSync", "Resume Builder"],
+  "strategy": "Search for identified project names as they appear in the PROJECTS section"
+}
+</example>
+
+</examples>
+
+<critical_rules>
+1. You MUST read the document and reference ACTUAL content, not generic patterns
+2. Your output should be specific enough that the Scanner can find exact matches
+3. If you cannot resolve an entity, explain what you found and suggest alternatives
+4. Always provide targetContent with specific strings from the document
+5. Return ONLY valid JSON - no explanations outside the JSON
+</critical_rules>
+
+</contextual_search_llm>`;
+
+  try {
+    console.log(`⏳ [CONTEXT] Calling Gemini Flash for contextual understanding...`);
+    const startTime = Date.now();
+
+    const model = geminiClient.getGenerativeModel({ model: "gemini-3-flash-preview" });
+    const result = await model.generateContent(contextualPrompt);
+    const responseText = result.response.text();
+
+    console.log(`✅ [CONTEXT] Gemini responded in ${Date.now() - startTime}ms`);
+    console.log(`📤 [CONTEXT] Response: ${responseText.substring(0, 500)}...`);
+
+    // Parse the JSON response
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.log(`⚠️ [CONTEXT] No JSON object found in response`);
+      return null;
+    }
+
+    const parsed: ContextualSearchResult = JSON.parse(jsonMatch[0]);
+
+    console.log(`🎯 [CONTEXT] Resolved entities: ${parsed.resolvedEntities.length}`);
+    parsed.resolvedEntities.forEach(e =>
+      console.log(`   - "${e.reference}" → "${e.resolvedTo}" (${e.context})`)
+    );
+    console.log(`🎯 [CONTEXT] Target content: ${parsed.targetContent.join(', ')}`);
+    console.log(`🎯 [CONTEXT] Strategy: ${parsed.strategy}`);
+
+    return parsed;
+  } catch (error) {
+    console.error(`❌ [CONTEXT] Error in contextual resolution:`, error);
+    return null;
+  }
+}
+
+/**
  * Use LLM to intelligently scan GDSM and find matching elements
  *
- * Strategy: Use pre-built GDSM elements (with positions/coordinates) instead of parsing HTML.
- * This is more efficient and includes spatial data for better context.
+ * Strategy: Two-pass architecture for semantic queries:
+ * 1. Contextual Search LLM (gemini-3-flash-preview): Reads document text, resolves entities
+ * 2. Scanner LLM (groq/gemini): Searches GDSM with element IDs
+ *
+ * For simple queries, skip the contextual pass and go directly to scanner.
  */
 async function scanDocument(query: string, gdsmElements: GDSMElementForScanner[]): Promise<ScanResult[]> {
   console.log(`\n🔍 [SCAN] Starting GDSM scan for query: "${query}"`);
   console.log(`📋 [SCAN] GDSM elements: ${gdsmElements.length}`);
+
+  // Check if query needs contextual resolution (entity references, semantic complexity)
+  let effectiveQuery = query;
+  let contextualResult: ContextualSearchResult | null = null;
+
+  if (needsContextualResolution(query)) {
+    console.log(`🧠 [SCAN] Query needs contextual resolution, invoking Contextual Search LLM...`);
+
+    // Extract plain text for contextual understanding
+    const plainText = extractPlainText(gdsmElements);
+
+    if (plainText.length > 100) {
+      contextualResult = await resolveContextualQuery(query, plainText);
+
+      if (contextualResult) {
+        // Use the enhanced search criteria from contextual LLM
+        effectiveQuery = contextualResult.searchCriteria;
+        console.log(`🎯 [SCAN] Using enhanced query: "${effectiveQuery.substring(0, 200)}..."`);
+      } else {
+        console.log(`⚠️ [SCAN] Contextual resolution failed, using original query`);
+      }
+    }
+  } else {
+    console.log(`⚡ [SCAN] Query is simple, skipping contextual resolution`);
+  }
 
   if (gdsmElements.length === 0) {
     console.log(`⚠️ [SCAN] No elements in GDSM - returning empty`);
@@ -74,86 +344,142 @@ async function scanDocument(query: string, gdsmElements: GDSMElementForScanner[]
     regexMatches.forEach(e => console.log(`   - [${e.id}] "${e.text.substring(0, 60)}"`));
   }
 
-  const scanPrompt = `You are a document scanner for a PDF editor. Your task is to find ALL elements that match the user's query.
+  // Build contextual hints section if we have contextual resolution results
+  let contextualHints = '';
+  if (contextualResult) {
+    const entityInfo = contextualResult.resolvedEntities.length > 0
+      ? contextualResult.resolvedEntities.map(e =>
+          `- "${e.reference}" = "${e.resolvedTo}" (${e.context})`
+        ).join('\n')
+      : '';
 
-## DATA SOURCE: Global Document Structure Model (GDSM)
+    const targetInfo = contextualResult.targetContent.length > 0
+      ? `Target content to find:\n${contextualResult.targetContent.map(t => `- "${t}"`).join('\n')}`
+      : '';
 
-You are given the GDSM - a structured representation of all document elements with:
-- **Element ID**: Unique identifier (e.g., "pf1-el-42")
-- **Page number**: Which page the element is on
-- **Position**: (x, y) coordinates and width x height in pixels (page-relative)
-- **Semantic type**: Auto-detected type like [email], [phone], [date], etc.
-- **Text content**: The actual text in the element
+    contextualHints = `
+<contextual_intelligence>
+The Contextual Search LLM has analyzed the document and resolved the query.
 
-This spatial data allows you to understand document layout (headers at top, footers at bottom, columns, etc.).
+${entityInfo ? `<resolved_entities>\n${entityInfo}\n</resolved_entities>` : ''}
 
-USER QUERY: "${query}"
+${targetInfo ? `<target_content>\n${targetInfo}\n</target_content>` : ''}
 
-DOCUMENT ELEMENTS (format: [element_id] (page N): "text content"):
+<strategy>${contextualResult.strategy}</strategy>
+
+PRIORITY: Use the target content and resolved entities above to find matches.
+These are SPECIFIC items identified from the document that match the user's intent.
+</contextual_intelligence>
+`;
+  }
+
+  const scanPrompt = `<document_scanner>
+
+<task>
+Find ALL elements matching the query using SEMANTIC UNDERSTANDING and SPATIAL AWARENESS.
+</task>
+
+<data_source>
+Global Document Structure Model (GDSM):
+- Element ID (e.g., "pf1-el-42")
+- Page number
+- Position: (x,y) + width×height in pixels
+- Semantic type: [email], [phone], [date], [url], etc.
+- Text content
+
+Position gives layout context: headers at y≈0, footers at y≈max, indented content, etc.
+</data_source>
+
+<user_query>${effectiveQuery}</user_query>
+${contextualHints}
+
+<elements>
 ${elementList}
+</elements>
 
-INSTRUCTIONS:
-1. Analyze the user's query to understand EXACTLY what they want to find
-2. Go through EVERY element in the list above
-3. Select ALL elements that match the query criteria
-4. Be THOROUGH but PRECISE - match what the user asked for, not more
+<matching_rules>
 
-## MATCHING RULES (CRITICAL - READ CAREFULLY)
+<semantic_patterns>
+Query may be SEMANTIC, not literal. INTERPRET meaning:
 
-### EXACT WORD MATCHING (Default for "containing", "with the word", etc.)
-When the user asks for elements containing a specific word, match the EXACT WORD as a standalone token:
-- A word is standalone if it's surrounded by spaces, punctuation, or line boundaries
-- Do NOT match the word as a SUBSTRING of a longer word
+<pattern type="section_headers">
+  Triggers: "section titles", "section headings", "headers like EXPERIENCE"
+  Find: ALL-CAPS text ("EXPERIENCE", "EDUCATION", "TECHNICAL PROJECTS")
+  - Standalone (not mid-sentence)
+  - Short (< 30 chars)
+  - Common headers: EXPERIENCE, EDUCATION, SKILLS, PROJECTS, SUMMARY, OBJECTIVE
+</pattern>
 
-EXAMPLES of EXACT WORD matching:
-| Query: "containing French" | Text | Match? | Reason |
-|---------------------------|------|--------|--------|
-| | "French language" | ✅ YES | "French" is a standalone word |
-| | "in French" | ✅ YES | "French" is a standalone word |
-| | "French" | ✅ YES | "French" is the entire text |
-| | "Francophone" | ❌ NO | "French" is a substring, not standalone |
-| | "Frenchman" | ❌ NO | "French" is a prefix, not standalone |
-| | "FR 101" | ❌ NO | "FR" is not "French" |
+<pattern type="project_names">
+  Triggers: "project names", "my projects", "project titles"
+  Find: Proper nouns (capitalized), often followed by " - " or " | "
+  - Starts with capital
+  - Title format (2-4 words)
+  - NOT full sentences
+  - Near bullet points
+</pattern>
 
-| Query: "containing phone" | Text | Match? | Reason |
-|---------------------------|------|--------|--------|
-| | "phone number" | ✅ YES | "phone" is standalone |
-| | "smartphone" | ❌ NO | "phone" is a suffix, not standalone |
-| | "telephone" | ❌ NO | "phone" is a suffix, not standalone |
+<pattern type="contact_info">
+  Triggers: "contact information", "contact details"
+  Find: Email (@), phone (digit patterns), often at top/bottom
+  - [email] or [phone] semantic types
+  - y < 100 (header) or y > page_height-100 (footer)
+</pattern>
 
-### SEMANTIC MATCHING (For "about", "related to", "regarding")
-When the user asks for content ABOUT or RELATED TO a topic, use broader interpretation:
-- Match direct mentions AND contextually related content
-- Example: "about Party B" matches "John Smith (Party B)", "the Buyer's address", etc.
+<pattern type="dates">
+  Triggers: "dates", "date ranges"
+  Find: MM/DD/YYYY, Month YYYY, YYYY-YYYY formats
+  - [date] semantic type
+  - Month names, year patterns
+</pattern>
 
-### PATTERN MATCHING (For formats like emails, phones, dates)
-Match the FORMAT/PATTERN, not a literal word:
-- "email addresses" → match patterns like "user@domain.com"
-- "phone numbers" → match patterns like "(555) 123-4567" or "555-123-4567"
-- "dates" → match patterns like "January 5, 2024" or "01/05/2024"
+</semantic_patterns>
 
-## VALIDATION RULES
-- Return ONLY element IDs that exist EXACTLY as shown in the list above
-- Do NOT invent, modify, or guess IDs
-- Do NOT over-match - precision is more important than recall
-- If unsure whether something matches, do NOT include it
-- If no matches exist, return an empty array
+<exact_word>
+For "containing [word]":
+Match STANDALONE word only (with spaces/punctuation boundaries)
 
-RESPONSE FORMAT:
-Return a JSON array with ALL matching elements. Each object must have:
-- elementId: the exact ID from the list (e.g., "pf1-el-42")
-- textContent: the text content of that element
-- page: the page number
+"containing French":
+✅ "French language" (standalone)
+❌ "Francophone" (substring)
+</exact_word>
 
-Example response:
+<pattern_match>
+For structural patterns (emails, phones, SSNs):
+Match FORMAT, not literal text
+Use semantic type hints
+</pattern_match>
+
+<spatial>
+Use position:
+- Headers: y < 100
+- Footers: y > page_height-100
+- Indented: x > 50
+- Same line: same y ± 5px
+</spatial>
+
+</matching_rules>
+
+<quality>
+1. THOROUGH - scan every element
+2. PRECISE - match exactly what's requested
+3. SEMANTIC - understand intent
+4. When unsure, INCLUDE (false positive > false negative)
+</quality>
+
+<output>
+JSON array of matching elements:
 [
-  {"elementId": "pf1-el-42", "textContent": "example text", "page": 1},
-  {"elementId": "pf2-el-15", "textContent": "another match", "page": 2}
+  {"elementId": "pf1-el-42", "textContent": "example", "page": 1},
+  {"elementId": "pf2-el-15", "textContent": "another", "page": 2}
 ]
 
-If no matches: []
+If none: []
 
-Return ONLY the JSON array, no other text or explanation.`;
+Return ONLY JSON - no explanations.
+</output>
+
+</document_scanner>`;
 
   // Decide which model to use based on document size
   // Groq is faster but has ~128K token limit (~400K chars)
